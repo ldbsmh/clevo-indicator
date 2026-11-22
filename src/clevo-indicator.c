@@ -45,12 +45,18 @@
 #include <sys/io.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <libayatana-appindicator/app-indicator.h>
+
+/* libayatana-appindicator >= 0.5.x 把 IS_APP_INDICATOR 改名为 APP_IS_INDICATOR */
+#ifndef APP_IS_INDICATOR
+#define APP_IS_INDICATOR(obj) IS_APP_INDICATOR(obj)
+#endif
 
 #define NAME "clevo-indicator"
 
@@ -84,15 +90,28 @@
 #define EC_PORT_FAN_CPU     0x01
 #define EC_PORT_FAN_GPU     0x02
 
-#define MAX_FAN_RPM 5500.0
+#define MAX_FAN_RPM 6000.0  /* T1000 实测 GPU 风扇满速约 5940 RPM */
 
 /* 降速平滑窗口：取最近 N 次读数的平均值。
  * 升速使用瞬时温度立即响应，降速使用平均值延迟响应，防止风扇抖动。*/
 #define TEMP_SMOOTH_DOWN_COUNT 30  /* 30 次 × 200ms = 约 6 秒 */
 
 typedef enum {
-    NA = 0, AUTO = 1, MANUAL = 2
+    NA = 0, AUTO = 1, MANUAL = 2, EPP = 3, CUSTOM = 4
 } MenuItemType;
+
+/* 风扇占空比上下限。本机实测（T1000，双风扇）：
+ *   60%→3802 RPM / 50%→3384 / 40%→2933 / 30%→2359 / 25%→2061
+ *   20%→1730 / 15%→1318 / 12%→1069 / 10%→880
+ * 10% 仍稳定转动、未失速，但留出积灰与轴承磨损的余量，手动下限取 15%。*/
+#define FAN_MANUAL_MIN 15
+#define FAN_AUTO_MIN   18
+
+/* CPU 电源偏好档位：本机实测只有 power 能压住全核睿频，
+ * balance_power / balance_performance / performance 三者表现完全相同
+ * （空闲时也锁 3.9GHz），因此菜单只提供两个有实际区别的选项。*/
+#define EPP_POWER   0   /* energy_performance_preference = power */
+#define EPP_DEFAULT 1   /* 系统默认 = balance_performance */
 
 static void main_init_share(void);
 static int main_ec_worker(void);
@@ -103,8 +122,15 @@ static int main_dump_fan(void);
 static int main_test_fan(int duty_percentage);
 static gboolean ui_update(gpointer user_data);
 static void ui_command_set_fan(long fan_duty);
-static void ui_command_quit(gchar* command);
-static void ui_toggle_menuitems(int fan_duty);
+static void ui_command_custom(long ignored);
+static void ui_command_set_epp(long which);
+static void ui_refresh_menuitems(void);
+static void ui_on_menu_show(GtkWidget* widget, gpointer data);
+static int sysfs_apply_epp(int which);
+static int sysfs_query_epp(void);
+static char* epp_config_path(void);
+static void epp_config_save(int which);
+static int epp_config_load(void);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
 static int ec_auto_duty_adjust(int temp_up, int temp_down);
@@ -127,6 +153,15 @@ static void signal_term(__sighandler_t handler);
 
 static AppIndicator* indicator = NULL;
 
+/* 自定义转速窗口（拖动滑块连续调节）。
+ * 用独立窗口而不是菜单项：SNI/dbusmenu 只能渲染普通菜单项，
+ * 放不了滑块控件。*/
+static GtkWidget* custom_window = NULL;
+static GtkWidget* custom_value_label = NULL;
+static GtkWidget* custom_rpm_label = NULL;
+static guint custom_apply_timer = 0;
+static int custom_pending_duty = 0;
+
 struct {
     char label[256];
     GCallback callback;
@@ -135,15 +170,20 @@ struct {
     GtkWidget* widget;
 
 }static menuitems[] = {
-        { "Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL },
+        { "CPU 电源：省电（推荐）", G_CALLBACK(ui_command_set_epp), EPP_POWER,
+                EPP, NULL },
+        { "CPU 电源：保持系统默认", G_CALLBACK(ui_command_set_epp), EPP_DEFAULT,
+                EPP, NULL },
         { "", NULL, 0L, NA, NULL },
-        { "Set FAN to  60%", G_CALLBACK(ui_command_set_fan), 60, MANUAL, NULL },
-        { "Set FAN to  70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL },
-        { "Set FAN to  80%", G_CALLBACK(ui_command_set_fan), 80, MANUAL, NULL },
-        { "Set FAN to  90%", G_CALLBACK(ui_command_set_fan), 90, MANUAL, NULL },
-        { "Set FAN to 100%", G_CALLBACK(ui_command_set_fan), 100, MANUAL, NULL },
+        { "风扇：自动（按温度）", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL },
         { "", NULL, 0L, NA, NULL },
-        { "Quit", G_CALLBACK(ui_command_quit), 0L, NA, NULL }
+        { "风扇：20%（静音）", G_CALLBACK(ui_command_set_fan), 20, MANUAL, NULL },
+        { "风扇：30%", G_CALLBACK(ui_command_set_fan), 30, MANUAL, NULL },
+        { "风扇：40%", G_CALLBACK(ui_command_set_fan), 40, MANUAL, NULL },
+        { "风扇：50%", G_CALLBACK(ui_command_set_fan), 50, MANUAL, NULL },
+        { "风扇：70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL },
+        { "风扇：100%（全速）", G_CALLBACK(ui_command_set_fan), 100, MANUAL, NULL },
+        { "风扇：自定义…", G_CALLBACK(ui_command_custom), 0L, CUSTOM, NULL }
 };
 
 static int menuitem_count = (sizeof(menuitems) / sizeof(menuitems[0]));
@@ -159,11 +199,16 @@ struct {
     volatile int auto_duty_val;
     volatile int manual_next_fan_duty;
     volatile int manual_prev_fan_duty;
+    volatile int epp_state;    /* 当前 CPU 电源档位 EPP_POWER / EPP_DEFAULT */
+    volatile int epp_request;  /* -1 = 无请求；否则待应用的档位 */
 }static *share_info = NULL;
 
 static pid_t parent_pid = 0;
 
 int main(int argc, char* argv[]) {
+    /* 必须在任何输出之前设置：worker 的 stdout 是 socket，默认全缓冲，
+     * 日志会卡在缓冲区里导致 journal 看不到。*/
+    setvbuf(stdout, NULL, _IOLBF, 0);
     printf("Simple fan control utility for Clevo laptops\n");
     if (check_proc_instances(NAME) > 1) {
         printf("Multiple running instances!\n");
@@ -217,7 +262,7 @@ Usage: clevo-indicator [fan-duty-percentage]\n\
 Dump/Control fan duty on Clevo laptops. Display indicator by default.\n\
 \n\
 Arguments:\n\
-  [fan-duty-percentage]\t\tTarget fan duty in percentage, from 40 to 100\n\
+  [fan-duty-percentage]\t\tTarget fan duty in percentage, from 15 to 100\n\
   -?\t\t\t\tDisplay this help and exit\n\
 \n\
 Without arguments this program should attempt to display an indicator in\n\
@@ -247,7 +292,7 @@ CPU fan and GPU fan are always synchronized to the same duty.\n\
             return main_dump_fan();
         } else {
             int val = atoi(argv[1]);
-            if (val < 40 || val > 100) {
+            if (val < FAN_MANUAL_MIN || val > 100) {
                 printf("invalid fan duty %d!\n", val);
                 return EXIT_FAILURE;
             }
@@ -271,16 +316,38 @@ static void main_init_share(void) {
     share_info->auto_duty_val = 0;
     share_info->manual_next_fan_duty = 0;
     share_info->manual_prev_fan_duty = 0;
+    share_info->epp_state = sysfs_query_epp();
+    share_info->epp_request = -1;
 }
 
 static int main_ec_worker(void) {
     setuid(0);
     system("modprobe ec_sys");
+    int epp_ticks = 0;
+    int manual_thermal_override = 0;
     while (share_info->exit == 0) {
         // check parent
         if (parent_pid != 0 && kill(parent_pid, 0) == -1) {
             printf("worker on parent death\n");
             break;
+        }
+        // CPU 电源偏好：UI 只负责发请求，实际写 sysfs 必须由 root 完成
+        int epp_req = share_info->epp_request;
+        if (epp_req >= 0) {
+            int applied = sysfs_apply_epp(epp_req);
+            if (applied > 0) {
+                printf("CPU 电源偏好 -> %s（%d 个核心）\n",
+                        epp_req == EPP_POWER ? "power" : "balance_performance",
+                        applied);
+                share_info->epp_state = epp_req;
+            } else {
+                printf("写入 CPU 电源偏好失败（需要 root 权限）\n");
+            }
+            share_info->epp_request = -1;
+        } else if (++epp_ticks >= 25) {
+            /* 每 5 秒回读一次，防止被其它程序改掉后菜单显示过期 */
+            epp_ticks = 0;
+            share_info->epp_state = sysfs_query_epp();
         }
         // write EC
         int new_fan_duty = share_info->manual_next_fan_duty;
@@ -303,7 +370,13 @@ static int main_ec_worker(void) {
             break;
         case 0x100:
             share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
-            share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
+            /* 部分机型（如混合显卡模式的 T1000）EC 侧 GPU 二极管
+             * 不上报，0xCD 恒为 0。非法值按 0 处理，避免自动模式
+             * 被错误温度拉高转速，也避免界面显示假的温度。*/
+            {
+                int gpu = buf[EC_REG_GPU_TEMP];
+                share_info->gpu_temp = (gpu > 0 && gpu < 110) ? gpu : 0;
+            }
             share_info->fan_duty = calculate_fan_duty(buf[EC_REG_FAN_DUTY]);
             share_info->fan_rpms = calculate_fan_rpms(buf[EC_REG_FAN_RPMS_HI],
                     buf[EC_REG_FAN_RPMS_LO]);
@@ -314,6 +387,33 @@ static int main_ec_worker(void) {
             printf("wrong EC size from sysfs: %ld\n", len);
         }
         close(io_fd);
+        /* 手动档的安全网：允许把转速压到 15%，但温度顶到 93°C 时
+         * 临时拉满，降到 80°C 以下再交还给用户设定的档位。
+         * 防止误设低档后忘了改回去而烧机器。*/
+        if (share_info->auto_duty == 1) {
+            manual_thermal_override = 0;
+        } else {
+            int t = MAX(share_info->cpu_temp, share_info->gpu_temp);
+            if (!manual_thermal_override && t >= 93
+                    && share_info->fan_duty < 100) {
+                char s_time[256];
+                get_time_string(s_time, 256, "%m/%d %H:%M:%S");
+                printf("%s 手动档 %d%% 但温度 %d°C 超限，临时全速\n", s_time,
+                        share_info->manual_next_fan_duty, t);
+                ec_write_fan_duty(100);
+                manual_thermal_override = 1;
+            } else if (manual_thermal_override && t <= 80) {
+                int target = share_info->manual_next_fan_duty;
+                if (target >= FAN_MANUAL_MIN) {
+                    char s_time[256];
+                    get_time_string(s_time, 256, "%m/%d %H:%M:%S");
+                    printf("%s 温度回落到 %d°C，恢复手动档 %d%%\n", s_time, t,
+                            target);
+                    ec_write_fan_duty(target);
+                }
+                manual_thermal_override = 0;
+            }
+        }
         // auto EC
         if (share_info->auto_duty == 1) {
             /* 升速：使用瞬时温度，立即响应温度峰值 */
@@ -374,17 +474,27 @@ static void main_ui_worker(int argc, char** argv) {
         menuitems[i].widget = item;
     }
     gtk_widget_show_all(indicator_menu);
+    /* 每次展开菜单前刷新勾选状态，避免显示过期 */
+    g_signal_connect(indicator_menu, "show", G_CALLBACK(ui_on_menu_show), NULL);
     //
     indicator = app_indicator_new(NAME, "brasero",
             APP_INDICATOR_CATEGORY_HARDWARE);
-    g_assert(IS_APP_INDICATOR(indicator));
+    g_assert(APP_IS_INDICATOR(indicator));
     app_indicator_set_label(indicator, "Init..", "XX");
     app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ATTENTION);
     app_indicator_set_ordering_index(indicator, -2);
     app_indicator_set_title(indicator, "Clevo");
     app_indicator_set_menu(indicator, GTK_MENU(indicator_menu));
     g_timeout_add(500, &ui_update, NULL);
-    ui_toggle_menuitems(share_info->fan_duty);
+    {
+        /* 恢复上次选择的 CPU 电源档位 */
+        int saved = epp_config_load();
+        if (saved >= 0) {
+            share_info->epp_request = saved;
+            share_info->epp_state = saved;
+        }
+    }
+    ui_refresh_menuitems();
     gtk_main();
     printf("main on UI quit\n");
 }
@@ -402,12 +512,16 @@ static void main_on_sigterm(int signum) {
 }
 
 static int main_dump_fan(void) {
+    int gpu_temp = ec_query_gpu_temp();
     printf("Dump fan information\n");
     printf("  CPU FAN Duty: %d%%\n", ec_query_fan_duty());
     printf("  CPU FAN RPMs: %d RPM\n", ec_query_fan_rpms());
     printf("  GPU FAN RPMs: %d RPM\n", ec_query_fan2_rpms());
     printf("  CPU Temp:     %d°C\n", ec_query_cpu_temp());
-    printf("  GPU Temp:     %d°C\n", ec_query_gpu_temp());
+    if (gpu_temp > 0 && gpu_temp < 110)
+        printf("  GPU Temp:     %d°C\n", gpu_temp);
+    else
+        printf("  GPU Temp:     N/A (EC 未上报此机型)\n");
     return EXIT_SUCCESS;
 }
 
@@ -421,14 +535,35 @@ static int main_test_fan(int duty_percentage) {
 
 static gboolean ui_update(gpointer user_data) {
     char label[256];
-    sprintf(label, "%d℃ %d℃", share_info->cpu_temp, share_info->gpu_temp);
+    if (share_info->gpu_temp > 0) {
+        sprintf(label, "%d℃ %d℃", share_info->cpu_temp, share_info->gpu_temp);
+    } else {
+        sprintf(label, "%d℃ --", share_info->cpu_temp);
+    }
     app_indicator_set_label(indicator, label, "XXXXXX");
+    /* 自定义窗口打开时同步显示实际占空比与转速 */
+    if (custom_rpm_label != NULL) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "当前 %d%%  ·  %d RPM",
+                share_info->fan_duty, share_info->fan_rpms);
+        gtk_label_set_text(GTK_LABEL(custom_rpm_label), buf);
+    }
     /* Use average RPM of CPU and GPU fans for icon animation */
     int avg_rpms = (share_info->fan_rpms + share_info->fan2_rpms) / 2;
     char icon_name[256];
+    /* 若图标主题没有 brasero-disc-XX 动画图标，则回退到静态图标 */
+    static int has_anim_icons = -1;
+    if (has_anim_icons < 0) {
+        GtkIconTheme* theme = gtk_icon_theme_get_default();
+        has_anim_icons = gtk_icon_theme_has_icon(theme, "brasero-disc-50") ? 1 : 0;
+    }
     double load = ((double) avg_rpms) / MAX_FAN_RPM * 100.0;
     double load_r = round(load / 5.0) * 5.0;
-    sprintf(icon_name, "brasero-disc-%02d", (int) load_r);
+    if (has_anim_icons) {
+        sprintf(icon_name, "brasero-disc-%02d", (int) load_r);
+    } else {
+        sprintf(icon_name, "brasero");
+    }
     app_indicator_set_icon(indicator, icon_name);
     return G_SOURCE_CONTINUE;
 }
@@ -446,26 +581,262 @@ static void ui_command_set_fan(long fan_duty) {
         share_info->auto_duty_val = 0;
         share_info->manual_next_fan_duty = fan_duty_val;
     }
-    ui_toggle_menuitems(fan_duty_val);
+    ui_refresh_menuitems();
 }
 
-static void ui_command_quit(gchar* command) {
-    printf("clicked on quit\n");
-    gtk_main_quit();
+/* ---------- 自定义转速窗口 ---------- */
+
+static gboolean ui_custom_apply(gpointer data) {
+    custom_apply_timer = 0;
+    if (share_info != NULL)
+        ui_command_set_fan((long) custom_pending_duty);
+    return G_SOURCE_REMOVE;
 }
 
-static void ui_toggle_menuitems(int fan_duty) {
-    for (int i = 0; i < menuitem_count; i++) {
-        if (menuitems[i].widget == NULL)
-            continue;
-        if (fan_duty == 0)
-            gtk_widget_set_sensitive(menuitems[i].widget,
-                    menuitems[i].type != AUTO);
-        else
-            gtk_widget_set_sensitive(menuitems[i].widget,
-                    menuitems[i].type != MANUAL
-                            || (int) menuitems[i].option != fan_duty);
+static void ui_custom_set_value_label(int v) {
+    if (custom_value_label == NULL)
+        return;
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+            "<span size='xx-large' weight='bold'>%d%%</span>", v);
+    gtk_label_set_markup(GTK_LABEL(custom_value_label), buf);
+}
+
+static void ui_custom_changed(GtkRange* range, gpointer data) {
+    int v = (int) gtk_range_get_value(range);
+    custom_pending_duty = v;
+    ui_custom_set_value_label(v);
+    /* 拖动过程中不要每移动 1% 就写一次 EC：停止拖动 300ms 后才下发 */
+    if (custom_apply_timer != 0)
+        g_source_remove(custom_apply_timer);
+    custom_apply_timer = g_timeout_add(300, ui_custom_apply, NULL);
+}
+
+static void ui_custom_destroy(GtkWidget* widget, gpointer data) {
+    if (custom_apply_timer != 0) {
+        g_source_remove(custom_apply_timer);
+        custom_apply_timer = 0;
     }
+    custom_window = NULL;
+    custom_value_label = NULL;
+    custom_rpm_label = NULL;
+}
+
+static void ui_command_custom(long ignored) {
+    if (custom_window != NULL) {
+        gtk_window_present(GTK_WINDOW(custom_window));
+        return;
+    }
+
+    GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), "风扇转速");
+    gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
+    gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
+    gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(win), 400, -1);
+
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 20);
+    gtk_container_add(GTK_CONTAINER(win), box);
+
+    GtkWidget* title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title),
+            "<span size='large' weight='bold'>拖动滑块调节风扇</span>");
+    gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
+
+    custom_value_label = gtk_label_new(NULL);
+    gtk_box_pack_start(GTK_BOX(box), custom_value_label, FALSE, FALSE, 0);
+
+    GtkWidget* scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
+            FAN_MANUAL_MIN, 100, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(scale), FALSE);
+    gtk_range_set_increments(GTK_RANGE(scale), 1, 10);
+    gtk_widget_set_size_request(scale, 340, -1);
+    gtk_box_pack_start(GTK_BOX(box), scale, FALSE, FALSE, 6);
+
+    GtkWidget* ends = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    char ends_left[64];
+    snprintf(ends_left, sizeof(ends_left),
+            "<span size='small'>%d%%  最静</span>", FAN_MANUAL_MIN);
+    GtkWidget* l = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(l), ends_left);
+    gtk_box_pack_start(GTK_BOX(ends), l, FALSE, FALSE, 0);
+    GtkWidget* r = gtk_label_new("<span size='small'>100%%  全速</span>");
+    gtk_label_set_markup(GTK_LABEL(r), "<span size='small'>100%  全速</span>");
+    gtk_box_pack_end(GTK_BOX(ends), r, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), ends, FALSE, FALSE, 0);
+
+    custom_rpm_label = gtk_label_new("当前 --");
+    gtk_box_pack_start(GTK_BOX(box), custom_rpm_label, FALSE, FALSE, 0);
+
+    GtkWidget* hint = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hint),
+            "<span size='small' color='#888888'>"
+            "拖动即切换到手动档，停止拖动后 0.3 秒生效</span>");
+    gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
+
+    /* 初始值：手动档沿用当前设定，自动档以 EC 实际占空比为起点 */
+    int init = (share_info->auto_duty == 0
+            && share_info->manual_next_fan_duty >= FAN_MANUAL_MIN)
+            ? share_info->manual_next_fan_duty
+            : share_info->fan_duty;
+    if (init < FAN_MANUAL_MIN)
+        init = FAN_MANUAL_MIN;
+    if (init > 100)
+        init = 100;
+    custom_pending_duty = init;
+    gtk_range_set_value(GTK_RANGE(scale), init);
+    ui_custom_set_value_label(init);
+
+    g_signal_connect(scale, "value-changed", G_CALLBACK(ui_custom_changed), NULL);
+    g_signal_connect(win, "destroy", G_CALLBACK(ui_custom_destroy), NULL);
+
+    custom_window = win;
+    gtk_widget_show_all(win);
+    gtk_window_present(GTK_WINDOW(win));
+}
+
+static void ui_command_set_epp(long which) {
+    int v = (int) which;
+    printf("clicked on cpu power mode: %d\n", v);
+    share_info->epp_request = v;
+    share_info->epp_state = v;
+    epp_config_save(v);
+    ui_refresh_menuitems();
+}
+
+static void ui_on_menu_show(GtkWidget* widget, gpointer data) {
+    ui_refresh_menuitems();
+}
+
+static void ui_refresh_menuitems(void) {
+    for (int i = 0; i < menuitem_count; i++) {
+        if (menuitems[i].widget == NULL || menuitems[i].type == NA)
+            continue;
+        int active = 0;
+        switch (menuitems[i].type) {
+        case EPP:
+            active = (share_info->epp_state == (int) menuitems[i].option);
+            break;
+        case AUTO:
+            active = (share_info->auto_duty == 1);
+            break;
+        case MANUAL:
+            active = (share_info->auto_duty == 0
+                    && share_info->manual_next_fan_duty
+                            == (int) menuitems[i].option);
+            break;
+        case CUSTOM: {
+            int d = share_info->manual_next_fan_duty;
+            active = (share_info->auto_duty == 0 && d > 0);
+            /* 占空比正好落在某个预设档上时，勾选归对应的预设项 */
+            for (int j = 0; j < menuitem_count && active; j++) {
+                if (menuitems[j].type == MANUAL
+                        && (int) menuitems[j].option == d)
+                    active = 0;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        char itemlabel[256];
+        if (menuitems[i].type == CUSTOM && active) {
+            snprintf(itemlabel, sizeof(itemlabel), "风扇：自定义…（当前 %d%%）",
+                    (int) share_info->manual_next_fan_duty);
+        } else {
+            snprintf(itemlabel, sizeof(itemlabel), "%s", menuitems[i].label);
+        }
+        char buf[300];
+        snprintf(buf, sizeof(buf), "%s %s", active ? "●" : "○", itemlabel);
+        gtk_menu_item_set_label(GTK_MENU_ITEM(menuitems[i].widget), buf);
+    }
+}
+
+/* ---------- CPU 电源偏好（intel_pstate HWP EPP） ----------
+ * 写 sysfs 需要 root，因此由 worker 进程执行，UI 只通过共享内存发请求。*/
+
+static int sysfs_apply_epp(int which) {
+    const char* val = (which == EPP_POWER) ? "power" : "balance_performance";
+    char path[256];
+    int applied = 0;
+    for (int i = 0; i < 64; i++) {
+        snprintf(path, sizeof(path),
+                "/sys/devices/system/cpu/cpufreq/policy%d/energy_performance_preference",
+                i);
+        int fd = open(path, O_WRONLY);
+        if (fd < 0)
+            continue;   /* 该编号不存在或不可写 */
+        ssize_t n = write(fd, val, strlen(val));
+        close(fd);
+        if (n == (ssize_t) strlen(val))
+            applied++;
+    }
+    return applied;
+}
+
+static int sysfs_query_epp(void) {
+    char buf[64] = {0};
+    int fd = open(
+            "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference",
+            O_RDONLY);
+    if (fd < 0)
+        return EPP_DEFAULT;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return EPP_DEFAULT;
+    return (strncmp(buf, "power", 5) == 0) ? EPP_POWER : EPP_DEFAULT;
+}
+
+static char* epp_config_path(void) {
+    static char path[512];
+    const char* xdg = getenv("XDG_CONFIG_HOME");
+    const char* home = getenv("HOME");
+    if (xdg != NULL && *xdg != '\0')
+        snprintf(path, sizeof(path), "%s/clevo-indicator/epp", xdg);
+    else if (home != NULL && *home != '\0')
+        snprintf(path, sizeof(path), "%s/.config/clevo-indicator/epp", home);
+    else
+        return NULL;
+    return path;
+}
+
+static void epp_config_save(int which) {
+    char* p = epp_config_path();
+    if (p == NULL)
+        return;
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", p);
+    char* slash = strrchr(dir, '/');
+    if (slash != NULL) {
+        *slash = '\0';
+        mkdir(dir, 0755);
+    }
+    FILE* fp = fopen(p, "w");
+    if (fp == NULL)
+        return;
+    fprintf(fp, "%s\n", which == EPP_POWER ? "power" : "default");
+    fclose(fp);
+}
+
+static int epp_config_load(void) {
+    char* p = epp_config_path();
+    if (p == NULL)
+        return -1;
+    FILE* fp = fopen(p, "r");
+    if (fp == NULL)
+        return -1;
+    char buf[32] = {0};
+    int rc = -1;
+    if (fgets(buf, sizeof(buf), fp) != NULL) {
+        if (strncmp(buf, "power", 5) == 0)
+            rc = EPP_POWER;
+        else if (strncmp(buf, "default", 7) == 0)
+            rc = EPP_DEFAULT;
+    }
+    fclose(fp);
+    return rc;
 }
 
 static int ec_init(void) {
@@ -486,25 +857,50 @@ static void ec_on_sigterm(int signum) {
  *   升速 —— 用瞬时温度 temp_up，快速响应，保护硬件
  *   降速 —— 用长期平均温度 temp_down（约 6 秒窗口），延迟响应，防止抖动
  */
+/* 档位切换死区：进出同一档位需要多走 3°C，
+ * 否则温度停在档位边界（如 60°C）时会每 200ms 反复跳档。*/
+#define AUTO_HYST 3
+
+/* 温度 → 占空比 映射表。
+ * 原曲线的阈值是按「空闲 30°C 左右」的机器写的，本机空闲就有 45–52°C，
+ * 于是自动模式长期停在 70–80%，永远降不下来。现按实测重标：
+ * 空闲 46–50°C→28–36%（约 2200–2900 RPM），84°C 以上才逐步拉到 90–100%。*/
 static int ec_auto_duty_adjust(int temp_up, int temp_down) {
-    int duty = share_info->fan_duty;
-    /* 升速：瞬时温度超过阈值立即提高占空比 */
-    if (temp_up >= 80 && duty < 100) return 100;
-    if (temp_up >= 70 && duty < 90)  return 90;
-    if (temp_up >= 60 && duty < 80)  return 80;
-    if (temp_up >= 50 && duty < 70)  return 70;
-    if (temp_up >= 40 && duty < 60)  return 60;
-    if (temp_up >= 30 && duty < 50)  return 50;
-    if (temp_up >= 20 && duty < 40)  return 40;
-    if (temp_up >= 10 && duty < 30)  return 30;
-    /* 降速：平均温度持续低于阈值才降档（滞后区间 10°C）*/
-    if (temp_down <= 10 && duty > 30)  return 30;
-    if (temp_down <= 20 && duty > 40)  return 40;
-    if (temp_down <= 30 && duty > 50)  return 50;
-    if (temp_down <= 40 && duty > 60)  return 60;
-    if (temp_down <= 50 && duty > 70)  return 70;
-    if (temp_down <= 60 && duty > 80)  return 80;
-    if (temp_down <= 70 && duty > 90)  return 90;
+    static const int duty_steps[] = { 18, 22, 28, 36, 48, 62, 78, 90, 100 };
+    static const int thresholds[] = { 36, 44, 52, 60, 68, 76, 84, 90 };
+    int last = (int) (sizeof(duty_steps) / sizeof(duty_steps[0])) - 1;
+
+    /* 用「上次写入值」而非 EC 回读值作比较基准：
+     * 回读是 0–255 量化后的百分比（写 28% 回读 27%），
+     * 用它比较会导致每 200ms 重复写一次 EC。*/
+    int cur = share_info->auto_duty_val;
+    if (cur == 0)
+        cur = share_info->fan_duty;     /* 刚切到自动模式，以 EC 实际值为起点 */
+
+    if (temp_up >= 92)
+        return 100;                     /* 急热：无视当前档位直接全速 */
+
+    /* 定位当前档位（不高于当前占空比的最大档） */
+    int idx = 0;
+    for (int i = 0; i <= last; i++) {
+        if (cur >= duty_steps[i])
+            idx = i;
+    }
+
+    /* 升温：瞬时温度越过「上一档门槛 + 死区」才升，可能连跳多档 */
+    int up = idx;
+    while (up < last && temp_up >= thresholds[up] + AUTO_HYST)
+        up++;
+    if (up > idx)
+        return duty_steps[up];
+
+    /* 降温：平滑温度低于「本档门槛 - 死区」才降 */
+    int dn = idx;
+    while (dn > 0 && temp_down <= thresholds[dn - 1] - AUTO_HYST)
+        dn--;
+    if (dn < idx)
+        return duty_steps[dn];
+
     return 0;
 }
 
@@ -538,7 +934,7 @@ static int ec_query_fan2_rpms(void) {
  * Both fans are always kept in sync.
  */
 static int ec_write_fan_duty(int duty_percentage) {
-    if (duty_percentage < 30 || duty_percentage > 100) {
+    if (duty_percentage < FAN_MANUAL_MIN || duty_percentage > 100) {
         printf("Wrong fan duty to write: %d\n", duty_percentage);
         return EXIT_FAILURE;
     }

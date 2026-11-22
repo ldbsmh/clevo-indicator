@@ -20,7 +20,7 @@ all: $(TARGET)
 
 install: $(TARGET)
 	@echo Install to ${DSTDIR}/bin/
-	@sudo install -m 4750 -g adm $(TARGET) ${DSTDIR}/bin/
+	@sudo install -m 4755 $(TARGET) ${DSTDIR}/bin/
 
 test: $(TARGET)
 	@sudo chown root $(TARGET)

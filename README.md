@@ -8,6 +8,16 @@
 
 ## 更新日志
 
+### 2026-11-22（本机适配）
+
+**新增**
+- 托盘菜单增加「风扇：自定义…」，弹出滑块窗口，可在 15% ~ 100% 之间按 1% 连续调节，并实时显示实际占空比与转速
+- 手动档增加高温安全网：占空比过低而温度顶到 93°C 时临时全速，降到 80°C 以下恢复用户设定
+
+**调整**
+- 手动档预设从 60/70/80/90/100 改为 20/30/40/50/70/100，下限从 60% 降到 15%（实测 10% 仍不失速，留 5% 余量）
+- 自动调速曲线按本机实测重标：原曲线以「空闲 30°C」为前提，本机空闲就有 45–52°C，导致自动模式长期停在 70–80% 降不下来；现在空闲约 28–36%
+
 ### 2026-03-12
 
 **新增**
@@ -30,23 +40,62 @@
 - 系统托盘实时显示 CPU 和 GPU 温度
 - 托盘图标动态反映风扇转速（转速越高图标越满）
 - 自动调速模式：根据 CPU/GPU 温度自动调节风扇占空比，取两者较高温度为基准
-- 手动模式：通过托盘菜单直接设置风扇占空比（60% ~ 100%）
+- 手动模式：托盘菜单提供 20/30/40/50/70/100% 预设，另有「自定义」窗口可用滑块连续调节 15% ~ 100%
 - CPU 风扇与 GPU 风扇始终同步，统一控制
+- CPU 电源档位切换：菜单里可直接改写 `intel_pstate` 的 `energy_performance_preference`（省电 / 保持系统默认）
+
+## 托盘菜单
+
+菜单只有一个，打开后上下分区（托盘协议只暴露一个菜单入口，左右键由桌面环境统一指向它，无法做左右分工）：
+
+```
+● CPU 电源：省电（推荐）      ← 当前生效项用 ● 标记
+○ CPU 电源：保持系统默认
+──────────────────────────
+● 风扇：自动（按温度）
+──────────────────────────
+○ 风扇：20%（静音）
+○ 风扇：30%
+○ 风扇：40%
+○ 风扇：50%
+○ 风扇：70%
+○ 风扇：100%（全速）
+○ 风扇：自定义…
+```
+
+点「自定义…」会弹出一个带滑块的小窗口，可在 `15% ~ 100%` 之间按 1% 连续调节，窗口内实时显示实际占空比与转速（见下节）。
+
+菜单里**没有退出项**：程序由 systemd 托管常驻，停止只能通过 `systemctl --user stop clevo-indicator`（见下节）。
+
+`CPU 电源` 只有两档，因为本机实测 `balance_power` / `balance_performance` / `performance` 三者行为完全相同（空闲时也锁 3.9GHz），只有 `power` 能真正降频，所以不提供没有实际区别的「平衡」档。
+
+选择会写入 `~/.config/clevo-indicator/epp`，下次启动自动恢复。写 sysfs 需要 root，由 worker 子进程执行，UI 只通过共享内存发请求。
 
 ## 自动调速算法
 
 | 温度 | 目标占空比 |
 |------|-----------|
-| ≥ 80°C | 100% |
-| ≥ 70°C | 90% |
-| ≥ 60°C | 80% |
-| ≥ 50°C | 70% |
-| ≥ 40°C | 60% |
-| ≥ 30°C | 50% |
-| ≥ 20°C | 40% |
-| ≥ 10°C | 30% |
+| ≥ 90°C | 100% |
+| ≥ 84°C | 90% |
+| ≥ 76°C | 78% |
+| ≥ 68°C | 62% |
+| ≥ 60°C | 48% |
+| ≥ 52°C | 36% |
+| ≥ 44°C | 28% |
+| ≥ 36°C | 22% |
+| < 36°C | 18% |
 
-降温时有约 5°C 的滞后区间，防止风扇频繁抖动。
+- 升温用瞬时温度，降温用最近约 6 秒的平均温度：只有平均温度也回落才降档，避免在阈值附近抖动。
+- 温度 ≥ 92°C 时无视当前档位直接拉满。
+- **手动档也有安全网**：占空比被设得很低（例如 15%）而温度顶到 93°C 时，自动临时全速；降到 80°C 以下再交还给用户设定的档位。实测 20% 手动档 + 满负载：83°C 时 20%，93°C 触发全速，负载结束后回落到 62°C 时恢复 20%。
+
+### 本机实测的占空比—转速对应关系
+
+| 占空比 | 15% | 20% | 25% | 30% | 40% | 50% | 60% |
+|---|---|---|---|---|---|---|---|
+| 转速 | 1318 | 1730 | 2061 | 2359 | 2933 | 3384 | 3802 |
+
+10% 仍能稳定转动（880 RPM，未失速），但考虑到积灰与轴承磨损会抬高启动门槛，手动下限取 15%。原版 60% 的下限在这台机器上明显过于保守——60% 时 3802 RPM，而空闲只需 20% 就能把温度稳在 48°C。
 
 ---
 
@@ -67,20 +116,49 @@ make
 make install   # 安装到 /usr/local/bin/，并自动设置 setuid 权限
 ```
 
-### 开机自启动
+### 常驻运行（systemd 用户服务）
+
+程序没有退出菜单，由 systemd 用户服务托管，任何原因退出都会在 1 秒后自动拉起：
 
 ```bash
-mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/clevo-indicator.desktop << EOF
-[Desktop Entry]
-Type=Application
-Name=Clevo Fan Control
-Exec=clevo-indicator
-Hidden=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true
-EOF
+mkdir -p ~/.config/systemd/user
+cp clevo-indicator.service ~/.config/systemd/user/     # 见下
+systemctl --user daemon-reload
+systemctl --user enable --now clevo-indicator.service
 ```
+
+`~/.config/systemd/user/clevo-indicator.service`：
+
+```ini
+[Unit]
+Description=Clevo Fan Control Indicator
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/clevo-indicator
+Restart=always
+RestartSec=1
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+保活层次（实测结果）：
+
+| 情形 | 结果 |
+|---|---|
+| UI 主进程崩溃（SIGSEGV） | 1–2 秒内重生，worker 检测到父进程消失后自行退出，不留孤儿 |
+| `kill -9` UI 主进程 | 1–2 秒内重生 |
+| worker 进程（root） | 普通用户**无权发信号**（setuid 后 real uid = root），只有 root 能杀 |
+| 注销 / 重启 | 登录时由 `default.target` 拉起 |
+
+**停止方式**（唯一出口）：`systemctl --user stop clevo-indicator.service`。显式 stop 后 systemd 不会自动重启；`start` 则随时可恢复（启动器条目已经指向 `systemctl --user start`）。
+
+注意 `StartLimitIntervalSec=0` 关掉了 systemd 的启动频率限制，否则短时间内连续崩溃会被判定为失败并放弃重启 —— 这正是「保活」需要的，但也意味着如果配置有误，它可能陷入 1 秒一次的重启循环，此时用 `journalctl --user -u clevo-indicator -n 50` 查原因。
+
 
 ---
 
@@ -109,3 +187,49 @@ clevo-indicator 80
   sudo modprobe ec_sys
   sudo od -Ax -t x1 /sys/kernel/debug/ec/ec0/io
   ```
+
+---
+
+## 本机适配记录（Deepin 25 / Terrans Force T1000）
+
+本项目在本机（内核 6.18.56，DDE 桌面）上做了以下必要修改：
+
+| 问题 | 处理 |
+|------|------|
+| libayatana-appindicator ≥ 0.5 把 `IS_APP_INDICATOR` 改名为 `APP_IS_INDICATOR`，链接报 undefined reference | 加 `#ifndef APP_IS_INDICATOR` 兼容宏，改用 `APP_IS_INDICATOR` |
+| 本机 EC `0xCD`（GPU 温度）恒为 0，混合显卡模式下 EC 侧二极管不上报 | 读取值落在 1~109 之外时按无效处理：托盘显示 `--`，自动调速只用 CPU 温度，避免被假温度拉高转速 |
+| 图标主题缺少 `brasero-disc-XX` 动画图标 | 启动时用 `gtk_icon_theme_has_icon` 检测，缺失则回退到静态 `brasero` 图标 |
+| GPU 风扇满速实测约 5940 RPM，原 `MAX_FAN_RPM=5500` 会使百分比溢出 | 调整为 6000 |
+| `make install` 用 `-m 4750 -g adm`，本机用户不在 `adm` 组导致无法执行 | 改为 `-m 4755` |
+
+### CPU 高温与风扇噪音
+
+本机实测：内核默认 `energy_performance_preference = balance_performance` 时，12 个线程**无论负载高低都被锁在 3.6~3.9GHz 全核睿频**，空闲状态下封装功耗 31W、温度 97~98°C、风扇 100%。
+
+| 电源偏好 | 频率 | 功耗 | 温度 |
+|---|---|---|---|
+| `balance_performance`（内核默认） | 3900MHz 全核 | 31W | 97~98°C |
+| `balance_power` | 3900MHz 全核（**无效**） | — | 98°C |
+| `performance` | 3900MHz 全核 | — | 94~97°C |
+| `power` | 800MHz 空闲 | ~15W | 50~55°C |
+
+已验证散热器本身正常（把 `max_perf_pct` 压到 30% 后温度 12 秒内 98→61°C），因此这是调频策略问题，不是硬件故障。
+
+DDE 控制中心的「节能模式」不控制 CPU 频率：实测开启后 `energy_performance_preference` 与频率均无变化，`dde-system-daemon` 及 `libdde*`/`libdtk*` 中也没有任何引用 `cpufreq`/`energy_performance_preference` 的代码。因此该档位只能通过本程序的菜单或 `cpu-epp-power.service` 设置。
+
+
+本机实测数据（CPU 满载 98°C）：
+
+```
+CPU FAN Duty: 100%   CPU FAN RPMs: 5097 RPM   GPU FAN RPMs: 5923 RPM
+CPU Temp: 98°C        GPU Temp: N/A（EC 未上报）
+```
+
+寄存器验证：`0x07` 与 coretemp 读数一致；写入 80% 后 `0xCE` 回读 80%、转速由 5085 降到 4520 RPM，确认写入链路有效。
+
+注意事项：
+
+- **退出程序后风扇保持最后一次手动占空比**，EC 自带的自动调速不会自动接管，直到重启或重新设置
+- DDE 会把托盘图标收进折叠区（面板上的 `^`），需要展开才能看到
+- 托盘温度文字通过 `XAyatanaLabel` 属性导出，DDE 是否渲染该文字取决于桌面版本；菜单控制不受影响
+

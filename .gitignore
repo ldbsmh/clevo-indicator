@@ -1,2 +1,5 @@
 bin/
 obj/
+
+# WorkBuddy 项目笔记（本机环境记录，不随代码发布）
+.workbuddy/

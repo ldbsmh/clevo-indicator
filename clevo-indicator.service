@@ -1,0 +1,18 @@
+[Unit]
+Description=Clevo Fan Control Indicator
+Documentation=file:///usr/local/share/doc/clevo-indicator/README.md
+# 关闭启动频率限制，避免连续崩溃后被 systemd 放弃
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/clevo-indicator
+# 任何原因退出都在 1 秒后拉起
+Restart=always
+RestartSec=1
+# 停止时把 fork 出的 worker 一起收掉
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target
