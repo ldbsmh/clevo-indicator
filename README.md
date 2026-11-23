@@ -8,9 +8,10 @@
 
 ## 更新日志
 
-### 2026-11-23（温度悬浮窗）
+### 2026-11-23（GPU 温度 + 温度悬浮窗）
 
 **新增**
+- GPU 温度改由 NVIDIA 驱动接口（NVML）提供：本机 EC 的 `0xCD` 恒为 0（混合显卡机型不映射 GPU 二极管），现在通过 `libnvidia-ml.so.1` 直接读取，实测可正常显示（空闲约 29°C）
 - 桌面悬浮小卡片：一屏看清 CPU/GPU 温度、当前风扇档位百分比、双风扇转速
 - 卡片无边框、圆角半透明、始终置顶、不抢焦点；拖动可移动，位置与开关状态持久化到 `~/.config/clevo-indicator/overlay`
 - 卡片上右键弹出与托盘同一份菜单；双击打开滑块调节窗口
@@ -86,12 +87,14 @@
 托盘图标只能显示两个温度，看不到转速和档位，所以另有一块常驻的小卡片：
 
 ```
-CPU   48°C         GPU   --
+CPU   48°C         GPU   29°C
 风扇  32% 自动     转速  2480/2400 RPM
 ```
 
 - **档位**是 EC 回读的实际 PWM 占空比（`0xCE` 寄存器），自动模式下也照实显示，能直接看出自动曲线当前把风扇放在哪一档
-- **转速**依次为 CPU 风扇 / GPU 风扇（寄存器 `0xD0/D1`、`0xD2/D3`）；GPU 温度若机型不上报则显示 `--`
+- **CPU 温度**取自 EC 寄存器 `0x07`
+- **GPU 温度**优先取 EC 寄存器 `0xCD`；该寄存器在混合显卡（Optimus）机型上恒为 0，此时自动改用 NVIDIA 驱动接口（NVML）读取，两者都拿不到才显示 `--`
+- **转速**依次为 CPU 风扇 / GPU 风扇（寄存器 `0xD0/D1`、`0xD2/D3`）
 - 温度着色：< 75°C 灰白，≥ 75°C 琥珀，≥ 88°C 红
 - **拖动**移动位置，松手即保存；**右键**弹出与托盘相同的菜单；**双击**打开滑块调节窗口
 - 窗口 `accept_focus = FALSE`，点它不会把正在使用的窗口挤到后面
@@ -134,6 +137,8 @@ SNI（StatusNotifierItem）协议只能渲染普通菜单项，放不下滑块�
 ```bash
 sudo apt-get install libayatana-appindicator3-dev libgtk-3-dev
 ```
+
+GPU 温度需要 NVIDIA 驱动自带的 `libnvidia-ml.so.1`（`nvidia-utils` / 驱动包一般会装）。它不属于编译依赖——程序用 `dlopen` 在运行时按需加载，缺失时 GPU 温度显示 `--`，其余功能不受影响。
 
 ### 编译并安装
 
@@ -225,7 +230,7 @@ clevo-indicator 80
 | 问题 | 处理 |
 |------|------|
 | libayatana-appindicator ≥ 0.5 把 `IS_APP_INDICATOR` 改名为 `APP_IS_INDICATOR`，链接报 undefined reference | 加 `#ifndef APP_IS_INDICATOR` 兼容宏，改用 `APP_IS_INDICATOR` |
-| 本机 EC `0xCD`（GPU 温度）恒为 0，混合显卡模式下 EC 侧二极管不上报 | 读取值落在 1~109 之外时按无效处理：托盘显示 `--`，自动调速只用 CPU 温度，避免被假温度拉高转速 |
+| 本机 EC `0xCD`（GPU 温度）恒为 0，混合显卡（Optimus）模式下 EC 侧二极管不上报 | 用 `dlopen` 加载 `libnvidia-ml.so.1`，通过 NVML 直接向 NVIDIA 驱动要温度；读不到（无驱动或 GPU 掉电）才显示 `--`，自动调速也只会使用实际可用的温度 |
 | 图标主题缺少 `brasero-disc-XX` 动画图标 | 启动时用 `gtk_icon_theme_has_icon` 检测，缺失则回退到静态 `brasero` 图标 |
 | GPU 风扇满速实测约 5940 RPM，原 `MAX_FAN_RPM=5500` 会使百分比溢出 | 调整为 6000 |
 | `make install` 用 `-m 4750 -g adm`，本机用户不在 `adm` 组导致无法执行 | 改为 `-m 4755` |

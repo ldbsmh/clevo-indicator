@@ -34,6 +34,7 @@
  */
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -144,6 +145,8 @@ static int ec_init(void);
 static int ec_auto_duty_adjust(int temp_up, int temp_down);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
+static int nvml_gpu_temperature(void);
+static int gpu_temperature_any(void);
 static int ec_query_fan_duty(void);
 static int ec_query_fan_rpms(void);
 static int ec_query_fan2_rpms(void);
@@ -353,6 +356,8 @@ static int main_ec_worker(void) {
     system("modprobe ec_sys");
     int epp_ticks = 0;
     int manual_thermal_override = 0;
+    int gpu_ticks = 4;   /* 首轮循环就立刻取一次 */
+    int gpu_cached = 0;
     while (share_info->exit == 0) {
         // check parent
         if (parent_pid != 0 && kill(parent_pid, 0) == -1) {
@@ -399,11 +404,20 @@ static int main_ec_worker(void) {
         case 0x100:
             share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
             /* 部分机型（如混合显卡模式的 T1000）EC 侧 GPU 二极管
-             * 不上报，0xCD 恒为 0。非法值按 0 处理，避免自动模式
-             * 被错误温度拉高转速，也避免界面显示假的温度。*/
+             * 不上报，0xCD 恒为 0。此时改用 NVML 向 NVIDIA 驱动要温度，
+             * 每秒取一次，其余循环沿用缓存值；两者都拿不到才显示 --。*/
             {
                 int gpu = buf[EC_REG_GPU_TEMP];
-                share_info->gpu_temp = (gpu > 0 && gpu < 110) ? gpu : 0;
+                if (gpu > 0 && gpu < 110) {
+                    share_info->gpu_temp = gpu;
+                } else {
+                    if (++gpu_ticks >= 5) {
+                        gpu_ticks = 0;
+                        int t = nvml_gpu_temperature();
+                        gpu_cached = (t > 0) ? t : 0;
+                    }
+                    share_info->gpu_temp = gpu_cached;
+                }
             }
             share_info->fan_duty = calculate_fan_duty(buf[EC_REG_FAN_DUTY]);
             share_info->fan_rpms = calculate_fan_rpms(buf[EC_REG_FAN_RPMS_HI],
@@ -547,16 +561,16 @@ static void main_on_sigterm(int signum) {
 }
 
 static int main_dump_fan(void) {
-    int gpu_temp = ec_query_gpu_temp();
+    int gpu_temp = gpu_temperature_any();
     printf("Dump fan information\n");
     printf("  CPU FAN Duty: %d%%\n", ec_query_fan_duty());
     printf("  CPU FAN RPMs: %d RPM\n", ec_query_fan_rpms());
     printf("  GPU FAN RPMs: %d RPM\n", ec_query_fan2_rpms());
     printf("  CPU Temp:     %d°C\n", ec_query_cpu_temp());
-    if (gpu_temp > 0 && gpu_temp < 110)
+    if (gpu_temp > 0)
         printf("  GPU Temp:     %d°C\n", gpu_temp);
     else
-        printf("  GPU Temp:     N/A (EC 未上报此机型)\n");
+        printf("  GPU Temp:     N/A (EC 与 NVML 均未提供)\n");
     return EXIT_SUCCESS;
 }
 
@@ -1339,6 +1353,76 @@ static int ec_query_cpu_temp(void) {
 
 static int ec_query_gpu_temp(void) {
     return ec_io_read(EC_REG_GPU_TEMP);
+}
+
+/* ---------- GPU 温度（NVIDIA 驱动接口） ----------
+ * 本机 EC 的 0xCD 恒为 0：混合显卡（Optimus）机型上 EC 固件不映射 GPU
+ * 二极管，只有独显全权接管时才回值。NVML 可以直接向驱动要温度，
+ * 用 dlopen 按需加载，没装 NVIDIA 驱动时安静退回 EC 值。*/
+
+typedef int nvml_return_t;
+typedef void* nvml_device_t;
+
+#define NVML_TEMPERATURE_GPU 0
+
+static void* nvml_lib = NULL;
+static nvml_device_t nvml_dev = NULL;
+static nvml_return_t (*nvml_get_temp)(nvml_device_t, int, unsigned int*) = NULL;
+static int nvml_state = 0;   /* 0 = 未尝试, 1 = 可用, -1 = 不可用 */
+
+static int nvml_init(void) {
+    if (nvml_state != 0)
+        return nvml_state > 0;
+
+    nvml_state = -1;
+    void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (lib == NULL)
+        lib = dlopen("/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+                RTLD_NOW | RTLD_LOCAL);
+    if (lib == NULL) {
+        printf("NVML 不可用（没装 NVIDIA 驱动？），GPU 温度回退 EC\n");
+        return 0;
+    }
+    nvml_return_t (*fn_init)(void) = dlsym(lib, "nvmlInit_v2");
+    nvml_return_t (*fn_count)(unsigned int*) = dlsym(lib,
+            "nvmlDeviceGetCount_v2");
+    nvml_return_t (*fn_handle)(unsigned int, nvml_device_t*) = dlsym(lib,
+            "nvmlDeviceGetHandleByIndex_v2");
+    nvml_get_temp = dlsym(lib, "nvmlDeviceGetTemperature");
+    if (fn_init == NULL || fn_count == NULL || fn_handle == NULL
+            || nvml_get_temp == NULL) {
+        dlclose(lib);
+        printf("NVML 符号缺失，GPU 温度回退 EC\n");
+        return 0;
+    }
+    unsigned int n = 0;
+    if (fn_init() != 0 || fn_count(&n) != 0 || n == 0
+            || fn_handle(0, &nvml_dev) != 0) {
+        dlclose(lib);
+        printf("NVML 初始化失败，GPU 温度回退 EC\n");
+        return 0;
+    }
+    nvml_lib = lib;
+    nvml_state = 1;
+    printf("NVML 已就绪，GPU 温度由驱动提供（%u 个设备）\n", n);
+    return 1;
+}
+
+static int nvml_gpu_temperature(void) {
+    if (!nvml_init())
+        return -1;
+    unsigned int t = 0;
+    if (nvml_get_temp(nvml_dev, NVML_TEMPERATURE_GPU, &t) != 0)
+        return -1;
+    return (t > 0 && t < 150) ? (int) t : -1;
+}
+
+/* 统一入口：优先 EC（全权独显机型有真实值），无效时问驱动 */
+static int gpu_temperature_any(void) {
+    int t = ec_query_gpu_temp();
+    if (t > 0 && t < 110)
+        return t;
+    return nvml_gpu_temperature();
 }
 
 static int ec_query_fan_duty(void) {

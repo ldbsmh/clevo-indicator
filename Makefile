@@ -30,7 +30,7 @@ test: $(TARGET)
 $(TARGET): $(OBJ) Makefile
 	@mkdir -p bin
 	@echo linking $(TARGET) from $(OBJ)
-	@$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS) -lm
+	@$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS) -lm -ldl
 
 clean:
 	rm $(OBJ) $(TARGET)
