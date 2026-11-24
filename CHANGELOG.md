@@ -1,6 +1,15 @@
 # 更新日志
 
-## [最新] - 2026-11-23
+## [最新] - 2026-11-24
+
+### 修复
+- **CPU 电源档位会「自己变回系统默认」**：旧逻辑每 5 秒回读 `energy_performance_preference` 并直接覆盖菜单状态，值一旦被外部改写，界面就跟着变成「保持系统默认」，且永不纠回。现在改为守护：每 2 秒核对，发现被改动立即写回用户选择，并记录时间、前后值与当时的 `governor` / 频率
+- `sysfs_query_epp()` 读取失败不再伪装成「默认档」（返回 `-1`），避免瞬时读取失败被误判为状态变化
+
+### 改进
+- worker 日志统一走 `ec_log()`，并补充了日志查询方式：worker 已 `setuid(0)`，日志归属 root，需用 `sudo journalctl -t clevo-indicator` 查看（此前误判为「日志丢失」）
+
+## [历史] - 2026-11-23
 
 ### 新增
 - **GPU 温度经 NVML 读取**：本机 EC 寄存器 `0xCD` 恒为 0（混合显卡/Optimus 机型上 EC 固件不映射 GPU 二极管），新增 `dlopen("libnvidia-ml.so.1")` + `nvmlDeviceGetTemperature` 路径，实测空闲可读到 29°C；NVML 不可用时安静回退到 EC 值，两者都无效才显示 `--`

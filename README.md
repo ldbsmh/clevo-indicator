@@ -82,6 +82,16 @@
 
 选择会写入 `~/.config/clevo-indicator/epp`，下次启动自动恢复。写 sysfs 需要 root，由 worker 子进程执行，UI 只通过共享内存发请求。
 
+**EPP 自愈**：worker 每 2 秒核对一次 `energy_performance_preference`。发现被外部改掉会立刻写回用户的选择，并记一条日志（含时间、改动前后值、当时 governor 与频率）：
+
+```bash
+sudo journalctl -t clevo-indicator | grep 电源偏好
+```
+
+没有这一步时，旧版本只是「回读并跟随显示」——值一旦被别的程序或固件改掉，菜单就诚实显示成「保持系统默认」，而且永远不会纠正，看起来就像「息屏久了自动变回默认」。
+
+> worker 进程已 `setuid(0)`，它的日志归到 root 名下，因此要用系统日志查，`journalctl --user` 里看不到。
+
 ## 悬浮窗
 
 托盘图标只能显示两个温度，看不到转速和档位，所以另有一块常驻的小卡片：

@@ -40,6 +40,7 @@
 #include <math.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -160,6 +161,8 @@ static int calculate_fan_duty(int raw_duty);
 static int calculate_fan_rpms(int raw_rpm_high, int raw_rpm_low);
 static int check_proc_instances(const char* proc_name);
 static void get_time_string(char* buffer, size_t max, const char* format);
+static void ec_log(const char* format, ...);
+static void ec_freq_context(char* buf, size_t size);
 static void signal_term(__sighandler_t handler);
 
 static AppIndicator* indicator = NULL;
@@ -348,6 +351,8 @@ static void main_init_share(void) {
     share_info->manual_next_fan_duty = 0;
     share_info->manual_prev_fan_duty = 0;
     share_info->epp_state = sysfs_query_epp();
+    if (share_info->epp_state < 0)
+        share_info->epp_state = EPP_DEFAULT;
     share_info->epp_request = -1;
 }
 
@@ -361,7 +366,7 @@ static int main_ec_worker(void) {
     while (share_info->exit == 0) {
         // check parent
         if (parent_pid != 0 && kill(parent_pid, 0) == -1) {
-            printf("worker on parent death\n");
+            ec_log("worker on parent death\n");
             break;
         }
         // CPU 电源偏好：UI 只负责发请求，实际写 sysfs 必须由 root 完成
@@ -369,18 +374,39 @@ static int main_ec_worker(void) {
         if (epp_req >= 0) {
             int applied = sysfs_apply_epp(epp_req);
             if (applied > 0) {
-                printf("CPU 电源偏好 -> %s（%d 个核心）\n",
+                ec_log("CPU 电源偏好 -> %s（%d 个核心）\n",
                         epp_req == EPP_POWER ? "power" : "balance_performance",
                         applied);
                 share_info->epp_state = epp_req;
             } else {
-                printf("写入 CPU 电源偏好失败（需要 root 权限）\n");
+                ec_log("写入 CPU 电源偏好失败（需要 root 权限）\n");
             }
             share_info->epp_request = -1;
-        } else if (++epp_ticks >= 25) {
-            /* 每 5 秒回读一次，防止被其它程序改掉后菜单显示过期 */
+        } else if (++epp_ticks >= 10) {
+            /* 每 2 秒核对一次。息屏、唤醒、固件自检等事件会把这个值打回
+             * balance_performance；原来只是回读、跟着显示，于是菜单就
+             * 「变回默认项」了。现在改成守住用户的选择：发现被改掉就立刻
+             * 写回，并把时间和前后值记进日志，方便追是谁改的。*/
             epp_ticks = 0;
-            share_info->epp_state = sysfs_query_epp();
+            int want = share_info->epp_state;
+            int actual = sysfs_query_epp();
+            if (actual >= 0 && actual != want) {
+                int applied = sysfs_apply_epp(want);
+                if (applied > 0) {
+                    char s_time[256];
+                    char ctx[128];
+                    get_time_string(s_time, 256, "%m/%d %H:%M:%S");
+                    ec_freq_context(ctx, sizeof(ctx));
+                    ec_log("%s CPU 电源偏好被外部改为 %s，已纠回 %s"
+                            "（%d 核，%s）\n", s_time,
+                            actual == EPP_POWER ? "power" : "balance_performance",
+                            want == EPP_POWER ? "power" : "balance_performance",
+                            applied, ctx);
+                } else {
+                    /* 写不进去（权限/接口变化）就跟随实际值，避免菜单说谎 */
+                    share_info->epp_state = actual;
+                }
+            }
         }
         // write EC
         int new_fan_duty = share_info->manual_next_fan_duty;
@@ -392,14 +418,14 @@ static int main_ec_worker(void) {
         // read EC
         int io_fd = open("/sys/kernel/debug/ec/ec0/io", O_RDONLY, 0);
         if (io_fd < 0) {
-            printf("unable to read EC from sysfs: %s\n", strerror(errno));
+            ec_log("unable to read EC from sysfs: %s\n", strerror(errno));
             exit(EXIT_FAILURE);
         }
         unsigned char buf[EC_REG_SIZE];
         ssize_t len = read(io_fd, buf, EC_REG_SIZE);
         switch (len) {
         case -1:
-            printf("unable to read EC from sysfs: %s\n", strerror(errno));
+            ec_log("unable to read EC from sysfs: %s\n", strerror(errno));
             break;
         case 0x100:
             share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
@@ -426,7 +452,7 @@ static int main_ec_worker(void) {
                     buf[EC_REG_FAN2_RPMS_LO]);
             break;
         default:
-            printf("wrong EC size from sysfs: %ld\n", len);
+            ec_log("wrong EC size from sysfs: %ld\n", len);
         }
         close(io_fd);
         /* 手动档的安全网：允许把转速压到 15%，但温度顶到 93°C 时
@@ -440,7 +466,7 @@ static int main_ec_worker(void) {
                     && share_info->fan_duty < 100) {
                 char s_time[256];
                 get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                printf("%s 手动档 %d%% 但温度 %d°C 超限，临时全速\n", s_time,
+                ec_log("%s 手动档 %d%% 但温度 %d°C 超限，临时全速\n", s_time,
                         share_info->manual_next_fan_duty, t);
                 ec_write_fan_duty(100);
                 manual_thermal_override = 1;
@@ -449,7 +475,7 @@ static int main_ec_worker(void) {
                 if (target >= FAN_MANUAL_MIN) {
                     char s_time[256];
                     get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                    printf("%s 温度回落到 %d°C，恢复手动档 %d%%\n", s_time, t,
+                    ec_log("%s 温度回落到 %d°C，恢复手动档 %d%%\n", s_time, t,
                             target);
                     ec_write_fan_duty(target);
                 }
@@ -481,7 +507,7 @@ static int main_ec_worker(void) {
             if (next_duty != 0 && next_duty != share_info->auto_duty_val) {
                 char s_time[256];
                 get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                printf("%s CPU=%d°C, GPU=%d°C, avg=%d°C, auto fan duty to %d%%\n", s_time,
+                ec_log("%s CPU=%d°C, GPU=%d°C, avg=%d°C, auto fan duty to %d%%\n", s_time,
                         share_info->cpu_temp, share_info->gpu_temp, temp_down, next_duty);
                 ec_write_fan_duty(next_duty);
                 share_info->auto_duty_val = next_duty;
@@ -490,7 +516,7 @@ static int main_ec_worker(void) {
         //
         usleep(200 * 1000);
     }
-    printf("worker quit\n");
+    ec_log("worker quit\n");
     return EXIT_SUCCESS;
 }
 
@@ -1218,17 +1244,18 @@ static int sysfs_apply_epp(int which) {
     return applied;
 }
 
+/* 读取失败返回 -1（区别于「确实是默认档」），否则返回 EPP_POWER / EPP_DEFAULT */
 static int sysfs_query_epp(void) {
     char buf[64] = {0};
     int fd = open(
             "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference",
             O_RDONLY);
     if (fd < 0)
-        return EPP_DEFAULT;
+        return -1;
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0)
-        return EPP_DEFAULT;
+        return -1;
     return (strncmp(buf, "power", 5) == 0) ? EPP_POWER : EPP_DEFAULT;
 }
 
@@ -1551,6 +1578,43 @@ static void get_time_string(char* buffer, size_t max, const char* format) {
     time(&timer);
     localtime_r(&timer, &tm_info);
     strftime(buffer, max, format, &tm_info);
+}
+
+/* 记录发生 EPP 变化时的调频上下文，便于回溯是谁动的 */
+static void ec_freq_context(char* buf, size_t size) {
+    char gov[32] = "?";
+    int freq = 0;
+    int fd = open("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor",
+            O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, gov, sizeof(gov) - 1);
+        if (n > 0)
+            gov[n - 1] = '\0';
+        close(fd);
+    }
+    fd = open("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+            O_RDONLY);
+    if (fd >= 0) {
+        char b[32] = { 0 };
+        if (read(fd, b, sizeof(b) - 1) > 0)
+            freq = atoi(b) / 1000;
+        close(fd);
+    }
+    snprintf(buf, size, "governor=%s 当前=%dMHz", gov, freq);
+}
+
+/* worker 的日志统一走这里。
+ * 注意：worker 已经 setuid(0)，它的 stdout 归到 root 名下，所以
+ * `journalctl --user` 看不到，要用系统日志查：
+ *     sudo journalctl -t clevo-indicator
+ * 之前误以为 fork 后日志会丢，其实是查错了地方；加 vsyslog 只会让每条
+ * 重复两遍，所以这里只保留 stdout。*/
+static void ec_log(const char* format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    vprintf(format, ap);
+    va_end(ap);
+    fflush(stdout);
 }
 
 static void signal_term(__sighandler_t handler) {
