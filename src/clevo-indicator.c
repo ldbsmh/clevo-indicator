@@ -94,10 +94,6 @@
 
 #define MAX_FAN_RPM 6000.0  /* T1000 实测 GPU 风扇满速约 5940 RPM */
 
-/* 降速平滑窗口：取最近 N 次读数的平均值。
- * 升速使用瞬时温度立即响应，降速使用平均值延迟响应，防止风扇抖动。*/
-#define TEMP_SMOOTH_DOWN_COUNT 30  /* 30 次 × 200ms = 约 6 秒 */
-
 typedef enum {
     NA = 0, AUTO = 1, MANUAL = 2, EPP = 3, CUSTOM = 4, OVERLAY = 5
 } MenuItemType;
@@ -143,7 +139,11 @@ static void epp_config_save(int which);
 static int epp_config_load(void);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
-static int ec_auto_duty_adjust(int temp_up, int temp_down);
+static int curve_auto_target(int cpu_temp, int gpu_temp);
+static int curve_ctrl_temperature(void);
+static const char* curve_reason(void);
+static void curve_load(void);
+static int main_print_curve(void);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
 static int nvml_gpu_temperature(void);
@@ -244,6 +244,11 @@ int main(int argc, char* argv[]) {
      * 日志会卡在缓冲区里导致 journal 看不到。*/
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("Simple fan control utility for Clevo laptops\n");
+    curve_load();
+    /* 只读曲线、不需要碰 EC，放在单实例检查之前：
+     * 服务已经在跑的时候也能随时查看曲线长什么样。*/
+    if (argc > 1 && strcmp(argv[1], "--curve") == 0)
+        return main_print_curve();
     if (check_proc_instances(NAME) > 1) {
         printf("Multiple running instances!\n");
         char* display = getenv("DISPLAY");
@@ -297,6 +302,7 @@ Dump/Control fan duty on Clevo laptops. Display indicator by default.\n\
 \n\
 Arguments:\n\
   [fan-duty-percentage]\t\tTarget fan duty in percentage, from 15 to 100\n\
+  --curve\t\t\tPrint the active fan curve table and exit\n\
   -?\t\t\t\tDisplay this help and exit\n\
 \n\
 Without arguments this program should attempt to display an indicator in\n\
@@ -322,6 +328,18 @@ process.\n\
 DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.\n\
 \n\
 CPU fan and GPU fan are always synchronized to the same duty.\n\
+\n\
+The automatic fan curve can be overridden in\n\
+~/.config/clevo-indicator/curve, for example:\n\
+\n\
+  cpu 40:18 48:22 56:28 64:40 72:54 78:68 84:84 89:100\n\
+  gpu 40:18 55:22 62:30 70:45 76:60 80:75 85:90 88:100\n\
+  hyst 3            # 降温需要比入口温度低 3°C 才降档\n\
+  critical 92       # 超过 92°C 无条件全速\n\
+  critical_offset 6 # 回落到 86°C 才交还曲线\n\
+  ramp_up 20        # 单步最多升 20%%\n\
+  ramp_down 5       # 单步最多降 5%%\n\
+  mode linear       # linear | step\n\
 \n");
             return main_dump_fan();
         } else {
@@ -484,31 +502,17 @@ static int main_ec_worker(void) {
         }
         // auto EC
         if (share_info->auto_duty == 1) {
-            /* 升速：使用瞬时温度，立即响应温度峰值 */
-            int temp_up = MAX(share_info->cpu_temp, share_info->gpu_temp);
-
-            /* 降速：使用长期平均温度，温度持续回落才降档，防止风扇抖动 */
-            static int cpu_history[TEMP_SMOOTH_DOWN_COUNT];
-            static int gpu_history[TEMP_SMOOTH_DOWN_COUNT];
-            static int history_idx = 0;
-            static int history_count = 0;
-            cpu_history[history_idx] = share_info->cpu_temp;
-            gpu_history[history_idx] = share_info->gpu_temp;
-            history_idx = (history_idx + 1) % TEMP_SMOOTH_DOWN_COUNT;
-            if (history_count < TEMP_SMOOTH_DOWN_COUNT) history_count++;
-            int cpu_sum = 0, gpu_sum = 0;
-            for (int i = 0; i < history_count; i++) {
-                cpu_sum += cpu_history[i];
-                gpu_sum += gpu_history[i];
-            }
-            int temp_down = MAX(cpu_sum / history_count, gpu_sum / history_count);
-
-            int next_duty = ec_auto_duty_adjust(temp_up, temp_down);
+            int next_duty = curve_auto_target(share_info->cpu_temp,
+                    share_info->gpu_temp);
             if (next_duty != 0 && next_duty != share_info->auto_duty_val) {
                 char s_time[256];
                 get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                ec_log("%s CPU=%d°C, GPU=%d°C, avg=%d°C, auto fan duty to %d%%\n", s_time,
-                        share_info->cpu_temp, share_info->gpu_temp, temp_down, next_duty);
+                ec_log("%s CPU=%d°C, GPU=%d°C, ctrl=%d°C, auto fan duty %d%% -> %d%%（%s）\n",
+                        s_time, share_info->cpu_temp, share_info->gpu_temp,
+                        curve_ctrl_temperature(),
+                        share_info->auto_duty_val ? share_info->auto_duty_val
+                                                  : share_info->fan_duty,
+                        next_duty, curve_reason());
                 ec_write_fan_duty(next_duty);
                 share_info->auto_duty_val = next_duty;
             }
@@ -1323,55 +1327,363 @@ static void ec_on_sigterm(int signum) {
         share_info->exit = 1;
 }
 
-/* 非对称滞后调速：
- *   升速 —— 用瞬时温度 temp_up，快速响应，保护硬件
- *   降速 —— 用长期平均温度 temp_down（约 6 秒窗口），延迟响应，防止抖动
+/* ================= 风扇曲线 =================
+ *
+ * 参考 NBFC-Linux / thinkfan / ClevoFanControl / asus-wmi 的成熟做法：
+ *
+ *   1. 曲线是一张「温度 : 占空比」节点表，节点之间线性插值
+ *      （可用 mode step 改成阶梯跳变，行为等同 asus-wmi 的 10°C 阶梯）
+ *   2. CPU、GPU 各一条曲线，每轮各算一次，取需求大的一方 ——
+ *      风扇是两热源共用的，谁更热就按谁吹
+ *   3. 升温用瞬时温度（保护硬件），降温用 6 秒平均值，并且必须低于
+ *      「当前档位的入口温度 - hyst」才降，这就是 NBFC 的 Up/DownThreshold
+ *   4. 单步升降有幅度上限，避免温度尖峰把风扇瞬间拉满、再瞬间落回
+ *   5. 临界温度立即全速，并锁存到回落到 critical - critical_offset
+ *      以下才交还曲线（NBFC 的 CriticalTemperature 机制）
+ *
+ * 节点表可以在 ~/.config/clevo-indicator/curve 里覆盖，格式见 README。
  */
-/* 档位切换死区：进出同一档位需要多走 3°C，
- * 否则温度停在档位边界（如 60°C）时会每 200ms 反复跳档。*/
-#define AUTO_HYST 3
 
-/* 温度 → 占空比 映射表。
- * 原曲线的阈值是按「空闲 30°C 左右」的机器写的，本机空闲就有 45–52°C，
- * 于是自动模式长期停在 70–80%，永远降不下来。现按实测重标：
- * 空闲 46–50°C→28–36%（约 2200–2900 RPM），84°C 以上才逐步拉到 90–100%。*/
-static int ec_auto_duty_adjust(int temp_up, int temp_down) {
-    static const int duty_steps[] = { 18, 22, 28, 36, 48, 62, 78, 90, 100 };
-    static const int thresholds[] = { 36, 44, 52, 60, 68, 76, 84, 90 };
-    int last = (int) (sizeof(duty_steps) / sizeof(duty_steps[0])) - 1;
+#define CURVE_MAX_NODES 10
+#define CURVE_PATH_MAX  512
+
+typedef struct {
+    int temp;
+    int duty;
+} FanNode;
+
+typedef struct {
+    FanNode nodes[CURVE_MAX_NODES];
+    int count;
+} FanCurve;
+
+/* 默认 CPU 曲线按本机实测标定：空闲 46–50°C 落在 22–24%（约 1900–2100 RPM），
+ * 60°C 约 34%，70°C 约 50%，80°C 约 73%，89°C 起满速。*/
+static FanCurve curve_cpu = {
+    .count = 8,
+    .nodes = {
+        { 40, 18 }, { 48, 22 }, { 56, 28 }, { 64, 40 },
+        { 72, 54 }, { 78, 68 }, { 84, 84 }, { 89, 100 }
+    }
+};
+
+/* GPU 曲线比 CPU 更陡：Max-Q 显卡空闲只有 30–40°C，一旦跑到 75°C 以上
+ * 就该大幅加风，因此低频段给得低、高频段给得狠，避免平时白吹。*/
+static FanCurve curve_gpu = {
+    .count = 8,
+    .nodes = {
+        { 40, 18 }, { 55, 22 }, { 62, 30 }, { 70, 45 },
+        { 76, 60 }, { 80, 75 }, { 85, 90 }, { 88, 100 }
+    }
+};
+
+static int curve_hyst = 3;              /* 降温滞回，°C */
+static int curve_critical = 92;         /* 临界温度，强制 100% */
+static int curve_critical_off = 6;      /* 回落这么多才退出强制全速 */
+static int curve_ramp_up = 20;          /* 单步最多升多少 %（200ms 一步） */
+static int curve_ramp_down = 3;         /* 单步最多降多少 % */
+
+/* 占空比死区：比当前高出 4% 才升、低出 2% 才降。
+ * 「升的阈值必须大于降的单步幅度」，否则降完一档立刻又被判为「该升了」，
+ * 会在同一个温度上来回写 EC（实测 25%→22%→24% 连写三次）。
+ * 4% 的代价是稳定时比理想值低最多 4%（约 2°C 更热），换取安静。*/
+#define CURVE_DEADBAND_UP   4
+#define CURVE_DEADBAND_DOWN 2
+static int curve_linear = 1;            /* 1=线性插值，0=阶梯跳变 */
+static int curve_critical_latch = 0;
+static char curve_last_reason[64] = "";
+static char curve_config_path[CURVE_PATH_MAX] = "";
+
+static const char* curve_reason(void) {
+    return curve_last_reason;
+}
+
+/* 曲线在某温度处给出的占空比 */
+static int curve_eval(const FanCurve* c, int temp) {
+    if (c->count <= 0)
+        return FAN_AUTO_MIN;
+    if (temp <= c->nodes[0].temp)
+        return c->nodes[0].duty;
+    for (int i = 0; i + 1 < c->count; i++) {
+        const FanNode* a = &c->nodes[i];
+        const FanNode* b = &c->nodes[i + 1];
+        if (temp < b->temp) {
+            if (!curve_linear || a->temp == b->temp)
+                return a->duty;
+            return a->duty
+                    + (temp - a->temp) * (b->duty - a->duty)
+                            / (b->temp - a->temp);
+        }
+    }
+    return c->nodes[c->count - 1].duty;
+}
+
+/* 反向：曲线给出这个占空比所需的入口温度。
+ * 降温时要求「平均值低于入口温度 - hyst」才降档，等价于 NBFC 的
+ * DownThreshold，比单纯按占空比做死区更贴合曲线形状。*/
+static int curve_entry_temp(const FanCurve* c, int duty) {
+    if (c->count <= 0)
+        return curve_critical;
+    if (duty <= c->nodes[0].duty)
+        return c->nodes[0].temp;
+    for (int i = 0; i + 1 < c->count; i++) {
+        const FanNode* a = &c->nodes[i];
+        const FanNode* b = &c->nodes[i + 1];
+        if (duty >= a->duty && duty <= b->duty) {
+            if (!curve_linear || b->duty == a->duty)
+                return b->temp;
+            return a->temp
+                    + (duty - a->duty) * (b->temp - a->temp)
+                            / (b->duty - a->duty);
+        }
+    }
+    return c->nodes[c->count - 1].temp;
+}
+
+/* 控制温度：升立即跟随、降按 1/8 衰减，且最多只比实测低 MAX_LAG 度。
+ *
+ * 为什么必须只用一个温度信号：早先的做法是「升温看瞬时值、降温看 6 秒均值」，
+ * 两个信号在升温斜坡上必然差 3°C 以上，于是每一轮都是「按瞬时值升档 →
+ * 按均值降档」，风扇在 26%/31% 之间来回跳。改成单一信号后方向只有一种。
+ *
+ * MAX_LAG 的作用是兜住瞬时尖峰：温度从 85 掉回 48 时，如果只靠 1/8 衰减，
+ * 控制温度会在 80 附近磨蹭好几秒，风扇被这一拍假数据顶到 75%；
+ * 夹住「实测 + 4°C」之后，下一轮就回到 52，1.5 秒内落回原档。*/
+#define CURVE_MAX_LAG 4
+static int curve_ctrl_t10[2] = { 0, 0 };   /* 控制温度，单位 0.1°C；[0]=CPU [1]=GPU */
+static int curve_ctrl_temp[2] = { 0, 0 };
+static int curve_driver = 0;              /* 当前由哪个热源主导：0=CPU 1=GPU */
+
+static int curve_filter_temp(int idx, int raw) {
+    int x = raw * 10;
+    if (x >= curve_ctrl_t10[idx]) {
+        curve_ctrl_t10[idx] = x;        /* 升温：立即跟随 */
+    } else {
+        int gap = curve_ctrl_t10[idx] - x;
+        int dec = gap / 8;
+        if (dec < 1)
+            dec = 1;
+        curve_ctrl_t10[idx] -= dec;     /* 降温：约 1.6 秒时间常数 */
+        if (curve_ctrl_t10[idx] > x + CURVE_MAX_LAG * 10)
+            curve_ctrl_t10[idx] = x + CURVE_MAX_LAG * 10;
+    }
+    curve_ctrl_temp[idx] = curve_ctrl_t10[idx] / 10;
+    return curve_ctrl_temp[idx];
+}
+
+static int curve_ctrl_temperature(void) {
+    return curve_ctrl_temp[curve_driver];
+}
+
+/* 每轮调速的核心：返回目标占空比，0 表示保持现状。
+ * 每个热源用各自的温度查各自的曲线，再取需求更大的那个 ——
+ * 风扇是两个热源共用的，GPU 打游戏时温度会超过 CPU，不能拿 CPU 的温度
+ * 去查 GPU 曲线（那样 GPU 一升温反而按 CPU 曲线算，等于白算）。*/
+static int curve_auto_target(int cpu_temp, int gpu_temp) {
+    int ctrl_cpu = curve_filter_temp(0, cpu_temp);
+    int cpu_need = curve_eval(&curve_cpu, ctrl_cpu);
+    int ctrl = ctrl_cpu;
+    int need = cpu_need;
+
+    if (gpu_temp > 0) {
+        int ctrl_gpu = curve_filter_temp(1, gpu_temp);
+        int gpu_need = curve_eval(&curve_gpu, ctrl_gpu);
+        if (gpu_need > need) {
+            need = gpu_need;
+            ctrl = ctrl_gpu;
+            curve_driver = 1;
+        } else {
+            curve_driver = 0;
+        }
+    } else {
+        curve_driver = 0;
+    }
+    const char* src = curve_driver ? "GPU" : "CPU";
 
     /* 用「上次写入值」而非 EC 回读值作比较基准：
      * 回读是 0–255 量化后的百分比（写 28% 回读 27%），
      * 用它比较会导致每 200ms 重复写一次 EC。*/
     int cur = share_info->auto_duty_val;
-    if (cur == 0)
+    if (cur <= 0)
         cur = share_info->fan_duty;     /* 刚切到自动模式，以 EC 实际值为起点 */
+    if (cur <= 0)
+        cur = FAN_AUTO_MIN;
 
-    if (temp_up >= 92)
-        return 100;                     /* 急热：无视当前档位直接全速 */
-
-    /* 定位当前档位（不高于当前占空比的最大档） */
-    int idx = 0;
-    for (int i = 0; i <= last; i++) {
-        if (cur >= duty_steps[i])
-            idx = i;
+    /* ① 临界温度：用实测值判断（不等滤波），无视曲线直接全速，
+     *    并锁存到控制温度回落到 critical - offset 以下才交还曲线 */
+    if (cpu_temp >= curve_critical || gpu_temp >= curve_critical) {
+        curve_critical_latch = 1;
+        snprintf(curve_last_reason, sizeof(curve_last_reason),
+                "临界 %d°C 强制全速", MAX(cpu_temp, gpu_temp));
+        return 100;
+    }
+    if (curve_critical_latch) {
+        if (ctrl > curve_critical - curve_critical_off) {
+            snprintf(curve_last_reason, sizeof(curve_last_reason),
+                    "临界锁存（控制温度 %d°C）", ctrl);
+            return 100;
+        }
+        snprintf(curve_last_reason, sizeof(curve_last_reason), "退出临界锁存");
+        curve_critical_latch = 0;
     }
 
-    /* 升温：瞬时温度越过「上一档门槛 + 死区」才升，可能连跳多档 */
-    int up = idx;
-    while (up < last && temp_up >= thresholds[up] + AUTO_HYST)
-        up++;
-    if (up > idx)
-        return duty_steps[up];
+    /* ② 升温：立即响应，但单步限制幅度，滤掉短时温度尖峰 */
+    if (need >= cur + CURVE_DEADBAND_UP) {
+        int target = MIN(need, cur + curve_ramp_up);
+        if (target > cur) {
+            snprintf(curve_last_reason, sizeof(curve_last_reason),
+                    "%s 曲线 %d°C", src, ctrl);
+            return target;
+        }
+    }
 
-    /* 降温：平滑温度低于「本档门槛 - 死区」才降 */
-    int dn = idx;
-    while (dn > 0 && temp_down <= thresholds[dn - 1] - AUTO_HYST)
-        dn--;
-    if (dn < idx)
-        return duty_steps[dn];
+    /* ③ 降温：控制温度必须低于「当前档位入口温度 - 滞回」才降，
+     *    等价于 NBFC 的 DownThreshold，且单步限幅 */
+    const FanCurve* dc = curve_driver ? &curve_gpu : &curve_cpu;
+    int entry = curve_entry_temp(dc, cur);
+    if (need <= cur - CURVE_DEADBAND_DOWN && ctrl <= entry - curve_hyst) {
+        int target = MAX(need, cur - curve_ramp_down);
+        if (target < cur) {
+            snprintf(curve_last_reason, sizeof(curve_last_reason),
+                    "降温（%d°C < 入口 %d°C - %d）",
+                    ctrl, entry, curve_hyst);
+            return target;
+        }
+    }
 
     return 0;
+}
+
+/* ---------- 曲线配置加载 ---------- */
+
+static int curve_parse_nodes(FanCurve* c, char* text) {
+    FanCurve tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    char* save = NULL;
+    for (char* tok = strtok_r(text, " \t\r\n", &save); tok != NULL;
+            tok = strtok_r(NULL, " \t\r\n", &save)) {
+        char* colon = strchr(tok, ':');
+        if (colon == NULL)
+            return -1;
+        *colon = '\0';
+        int t = atoi(tok);
+        int d = atoi(colon + 1);
+        if (t < 20 || t > 110 || d < 5 || d > 100)
+            return -1;
+        if (tmp.count >= CURVE_MAX_NODES)
+            return -1;
+        if (tmp.count > 0) {
+            /* 温度必须递增、占空比不许回落，否则曲线语义就乱套了 */
+            if (t <= tmp.nodes[tmp.count - 1].temp)
+                return -1;
+            if (d < tmp.nodes[tmp.count - 1].duty)
+                return -1;
+        }
+        tmp.nodes[tmp.count].temp = t;
+        tmp.nodes[tmp.count].duty = d;
+        tmp.count++;
+    }
+    if (tmp.count < 2)
+        return -1;
+    *c = tmp;
+    return 0;
+}
+
+static int curve_clamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void curve_load(void) {
+    const char* env = getenv("CLEVO_CURVE");
+    const char* home = getenv("HOME");
+    if (env != NULL && env[0] != '\0') {
+        snprintf(curve_config_path, sizeof(curve_config_path), "%s", env);
+    } else if (home != NULL && home[0] != '\0') {
+        snprintf(curve_config_path, sizeof(curve_config_path),
+                "%s/.config/clevo-indicator/curve", home);
+    } else {
+        return;                         /* 没有 HOME，就用内置默认曲线 */
+    }
+
+    FILE* fp = fopen(curve_config_path, "r");
+    if (fp == NULL) {
+        printf("未找到曲线配置 %s，使用内置默认曲线\n", curve_config_path);
+        return;
+    }
+
+    char line[512];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        lineno++;
+        char* hash = strchr(line, '#');
+        if (hash != NULL)
+            *hash = '\0';
+        char* p = line;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0' || *p == '\n' || *p == '\r')
+            continue;
+        char* key = p;
+        char* sep = strpbrk(p, " \t");
+        char* rest = (char*) "";
+        if (sep != NULL) {
+            *sep = '\0';
+            rest = sep + 1;
+        }
+        if (strcmp(key, "cpu") == 0) {
+            if (curve_parse_nodes(&curve_cpu, rest) != 0) {
+                printf("曲线配置第 %d 行无效（温度需递增、占空比不可回落），"
+                       "CPU 曲线保留默认\n", lineno);
+            }
+        } else if (strcmp(key, "gpu") == 0) {
+            if (curve_parse_nodes(&curve_gpu, rest) != 0) {
+                printf("曲线配置第 %d 行无效，GPU 曲线保留默认\n", lineno);
+            }
+        } else if (strcmp(key, "hyst") == 0) {
+            curve_hyst = curve_clamp(atoi(rest), 0, 15);
+        } else if (strcmp(key, "critical") == 0) {
+            curve_critical = curve_clamp(atoi(rest), 60, 105);
+        } else if (strcmp(key, "critical_offset") == 0) {
+            curve_critical_off = curve_clamp(atoi(rest), 0, 25);
+        } else if (strcmp(key, "ramp_up") == 0) {
+            curve_ramp_up = curve_clamp(atoi(rest), 1, 100);
+        } else if (strcmp(key, "ramp_down") == 0) {
+            curve_ramp_down = curve_clamp(atoi(rest), 1, 100);
+        } else if (strcmp(key, "mode") == 0) {
+            if (strncmp(rest, "step", 4) == 0)
+                curve_linear = 0;
+            else if (strncmp(rest, "linear", 6) == 0)
+                curve_linear = 1;
+        } else {
+            printf("曲线配置第 %d 行：未知配置项 %s，已忽略\n", lineno, key);
+        }
+    }
+    fclose(fp);
+    printf("已加载曲线配置 %s（%s，滞回 %d°C，临界 %d°C，"
+           "上升 +%d%%/步，下降 -%d%%/步）\n",
+            curve_config_path, curve_linear ? "线性插值" : "阶梯跳变",
+            curve_hyst, curve_critical, curve_ramp_up, curve_ramp_down);
+}
+
+/* --curve：把当前曲线（含插值结果）打印成表，方便验证配置改得对不对 */
+static int main_print_curve(void) {
+    printf("曲线配置：%s\n", curve_config_path[0] ? curve_config_path : "内置默认");
+    printf("插值方式：%s   滞回：%d°C   临界：%d°C（回落 %d°C 解除）\n",
+            curve_linear ? "线性" : "阶梯", curve_hyst, curve_critical,
+            curve_critical_off);
+    printf("单步限幅：上升 +%d%%  下降 -%d%%\n\n", curve_ramp_up,
+            curve_ramp_down);
+    printf(" 温度   CPU曲线   GPU曲线   同温取用\n");
+    printf(" ------------------------------------\n");
+    for (int t = 30; t <= 100; t += 2) {
+        int a = curve_eval(&curve_cpu, t);
+        int b = curve_eval(&curve_gpu, t);
+        int use = MAX(a, b);
+        printf(" %3d°C  %5d%%   %5d%%    %4d%%%s\n", t, a, b, use,
+                (t >= curve_critical) ? "  ← 临界全速" : "");
+    }
+    printf("\n注：运行时 CPU、GPU 各查各的曲线再取较大者，上表假设两者同温。\n");
+    return EXIT_SUCCESS;
 }
 
 static int ec_query_cpu_temp(void) {
