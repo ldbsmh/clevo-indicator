@@ -2,6 +2,8 @@
 
 适用于 Ubuntu 的 Clevo（蓝天）笔记本风扇控制工具，在系统托盘显示温度和风扇信息，支持自动调速和手动控制。
 
+本仓库：https://github.com/ldbsmh/clevo-indicator
+
 原项目地址：https://github.com/SkyLandTW/clevo-indicator
 
 ---
@@ -221,8 +223,8 @@ GPU 温度需要 NVIDIA 驱动自带的 `libnvidia-ml.so.1`（`nvidia-utils` / �
 ### 编译并安装
 
 ```bash
-git clone https://github.com/daiyuanxin7/-clevo-indicator.git
-cd -clevo-indicator
+git clone https://github.com/ldbsmh/clevo-indicator.git
+cd clevo-indicator
 make
 make install   # 安装到 /usr/local/bin/，并自动设置 setuid 权限
 ```
