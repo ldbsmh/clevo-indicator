@@ -127,8 +127,11 @@ static void ui_refresh_menuitems(void);
 static void ui_on_menu_show(GtkWidget* widget, gpointer data);
 static void ui_load_css(void);
 static void ui_overlay_show(void);
-static GtkWidget* ui_overlay_cell(const char* caption, GtkWidget** value_out,
-        int value_width, const char* tail, GtkWidget** tail_out);
+static GtkWidget* ui_overlay_cap(const char* text);
+static GtkWidget* ui_overlay_row(GtkOrientation orientation);
+static GtkWidget* ui_overlay_ring(void);
+static void ui_overlay_ring_set(GtkWidget* ring, double frac,
+        const char* color);
 static void ui_overlay_update(void);
 static void ui_overlay_config_save(int visible, int x, int y);
 static int ui_overlay_config_load(int* visible, int* x, int* y);
@@ -182,11 +185,25 @@ static int custom_pending_duty = 0;
 /* 温度 / 转速悬浮窗：无边框卡片，置顶、半透明、可拖动。
  * 菜单只能显示文字，看不到实时读数，所以单独做一块小面板。*/
 static GtkWidget* overlay_window = NULL;
-static GtkWidget* overlay_cpu_val = NULL;
+static GtkWidget* overlay_cpu_val = NULL;      /* 顶部大字：CPU 温度 */
+static GtkWidget* overlay_cpu_tail = NULL;     /* 顶部右侧：档位 + 自动/手动 */
 static GtkWidget* overlay_gpu_val = NULL;
-static GtkWidget* overlay_fan_mode = NULL;
+static GtkWidget* overlay_gpu_tail = NULL;     /* GPU 风扇转速 */
+static GtkWidget* overlay_fan_mode = NULL;     /* 档位行的 自动/手动 */
 static GtkWidget* overlay_duty_val = NULL;
 static GtkWidget* overlay_rpm_val = NULL;
+static GtkWidget* overlay_ring_gpu = NULL;
+static GtkWidget* overlay_ring_duty = NULL;
+static GtkWidget* overlay_ring_rpm = NULL;
+static GtkWidget* overlay_spark = NULL;
+
+/* 折线用的温度历史：每秒采一个点，保留 60 秒 */
+#define OVERLAY_SPARK_POINTS 60
+static int overlay_spark_hist[OVERLAY_SPARK_POINTS];
+static int overlay_spark_len = 0;
+static int overlay_spark_pos = 0;
+static int overlay_spark_tick = 0;
+
 static gboolean overlay_dragging = FALSE;
 static int overlay_drag_dx = 0;
 static int overlay_drag_dy = 0;
@@ -783,8 +800,8 @@ static void ui_command_custom(long ignored) {
 
 static void ui_load_css(void) {
     GtkCssProvider* provider = gtk_css_provider_new();
-    /* 用自绘背景（见 ui_overlay_draw），这里把主题背景清掉，
-     * 否则无边框窗口会带一圈默认的灰色描边。*/
+    /* 卡片外观全部走 CSS，只有外框圆角和描边用 cairo 自绘
+     * （见 ui_overlay_draw），因为 GTK3 的 box-shadow 在透明窗口上不生效。*/
     gtk_css_provider_load_from_data(provider,
             "window.clevo-overlay, window.clevo-overlay.background {"
             "  background-color: transparent;"
@@ -793,7 +810,34 @@ static void ui_load_css(void) {
             "  border: none;"
             "}\n"
             /* 等宽数字：温度/转速位数变化时卡片宽度不跳 */
-            "window.clevo-overlay label { font-feature-settings: 'tnum'; }\n",
+            "window.clevo-overlay label { font-feature-settings: 'tnum'; }\n"
+            /* 内层分块：比外框亮一点的白，形成玻璃叠加感 */
+            "window.clevo-overlay .ov-row {"
+            "  background-color: rgba(255, 255, 255, 0.058);"
+            "  background-image: none;"
+            "  border: none;"
+            "  border-radius: 12px;"
+            "  padding: 7px 11px;"
+            "}\n"
+            "window.clevo-overlay .ov-cap {"
+            "  color: rgba(255, 255, 255, 0.52);"
+            "  font-size: 9pt;"
+            "  font-weight: 500;"
+            "}\n"
+            "window.clevo-overlay .ov-hero {"
+            "  color: #f4f6f8;"
+            "  font-size: 19pt;"
+            "  font-weight: 500;"
+            "}\n"
+            "window.clevo-overlay .ov-val {"
+            "  color: #f4f6f8;"
+            "  font-size: 12pt;"
+            "  font-weight: 500;"
+            "}\n"
+            "window.clevo-overlay .ov-sub {"
+            "  color: rgba(255, 255, 255, 0.46);"
+            "  font-size: 8pt;"
+            "}\n",
             -1, NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
             GTK_STYLE_PROVIDER(provider),
@@ -861,57 +905,199 @@ static int ui_overlay_config_load(int* visible, int* x, int* y) {
     return 1;
 }
 
-/* 温度越高越醒目：正常灰白、偏热琥珀、过热红 */
+/* 温度越高越醒目：正常近白、偏热琥珀、过热红 */
 static const char* ui_overlay_temp_color(int t) {
     if (t >= 88)
-        return "#ff5f56";
+        return "#ff6b60";
     if (t >= 75)
-        return "#ffb454";
-    return "#eaeaea";
+        return "#f2b63f";
+    return "#eef1f4";
 }
 
-/* 一格 = 小号说明 + 大号数值（+ 可选小号尾注）。
- * tail_out 非空时额外生成一个尾注标签，供动态改文字。*/
-static GtkWidget* ui_overlay_cell(const char* caption, GtkWidget** value_out,
-        int value_width, const char* tail, GtkWidget** tail_out) {
-    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    char buf[128];
-    snprintf(buf, sizeof(buf), "<span size='small' color='#8b9199'>%s</span>",
-            caption);
-    GtkWidget* cap = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(cap), buf);
-    /* GtkLabel 内部默认居中（xalign=0.5），会让数值在定宽框里飘到中间，
-     * 和前面的说明拉开距离，所以显式左对齐 */
-    gtk_label_set_xalign(GTK_LABEL(cap), 0.0f);
-    gtk_widget_set_halign(cap, GTK_ALIGN_START);
-    gtk_widget_set_valign(cap, GTK_ALIGN_END);
-    gtk_box_pack_start(GTK_BOX(box), cap, FALSE, FALSE, 0);
+/* 圆环底色比数值柔和：正常用青绿，避免整块卡片太吵 */
+static const char* ui_overlay_ring_temp_color(int t) {
+    if (t >= 88)
+        return "#ff6b60";
+    if (t >= 75)
+        return "#f2b63f";
+    return "#4ec9a8";
+}
 
-    GtkWidget* val = gtk_label_new(NULL);
-    gtk_label_set_xalign(GTK_LABEL(val), 0.0f);
-    gtk_widget_set_halign(val, GTK_ALIGN_START);
-    gtk_widget_set_valign(val, GTK_ALIGN_END);
-    gtk_widget_set_size_request(val, value_width, -1);
-    gtk_box_pack_start(GTK_BOX(box), val, FALSE, FALSE, 0);
-    *value_out = val;
+/* ---------- 圆环指示器 ----------
+ * 自绘的小组件：一圈淡轨 + 一段彩色弧，从 12 点方向顺时针。
+ * 用 GtkDrawingArea 而不是字符画，是为了弧线端点能圆头、边缘抗锯齿。*/
+typedef struct {
+    double frac;
+    double r, g, b;
+} OverlayRing;
 
-    if (tail != NULL) {
-        GtkWidget* t = gtk_label_new(NULL);
-        gtk_label_set_xalign(GTK_LABEL(t), 0.0f);
-        gtk_widget_set_halign(t, GTK_ALIGN_START);
-        gtk_widget_set_valign(t, GTK_ALIGN_END);
-        gtk_box_pack_start(GTK_BOX(box), t, FALSE, FALSE, 0);
-        if (tail_out != NULL)
-            *tail_out = t;
+static gboolean ui_overlay_ring_draw(GtkWidget* widget, cairo_t* cr,
+        gpointer user_data) {
+    OverlayRing* ring = g_object_get_data(G_OBJECT(widget), "ov-ring");
+    if (ring == NULL)
+        return FALSE;
+    GtkAllocation a;
+    gtk_widget_get_allocation(widget, &a);
+    double cx = a.width / 2.0, cy = a.height / 2.0;
+    double radius = MIN(a.width, a.height) / 2.0 - 2.0;
+    if (radius <= 1.0)
+        return FALSE;
+
+    cairo_set_line_width(cr, 3.0);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+
+    /* 轨道留 24° 缺口，彩色弧从缺口之后开始，视觉上有「进度」的起点 */
+    const double gap = 14.0 * M_PI / 180.0;
+    double start = -M_PI / 2.0 + gap / 2.0;
+    double sweep = 2.0 * M_PI - gap;
+
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, cx, cy, radius, start, start + sweep);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.17);
+    cairo_stroke(cr);
+
+    double f = ring->frac;
+    if (f > 0.004) {
+        if (f > 1.0)
+            f = 1.0;
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, cx, cy, radius, start, start + sweep * f);
+        cairo_set_source_rgba(cr, ring->r, ring->g, ring->b, 0.95);
+        cairo_stroke(cr);
     }
+    return FALSE;
+}
+
+static void ui_overlay_ring_free(gpointer data) {
+    g_free(data);
+}
+
+/* 自绘控件本身是独立 GdkWindow，会截住鼠标事件，
+ * 导致在圆环/折线上拖动或右键都没反应。把输入形状清空，事件透给窗口。*/
+static void ui_overlay_pass_through(GtkWidget* widget) {
+    cairo_region_t* empty = cairo_region_create();
+    gtk_widget_input_shape_combine_region(widget, empty);
+    cairo_region_destroy(empty);
+}
+
+static GtkWidget* ui_overlay_ring(void) {
+    GtkWidget* w = gtk_drawing_area_new();
+    gtk_widget_set_size_request(w, 26, 26);
+    gtk_widget_set_valign(w, GTK_ALIGN_CENTER);
+    ui_overlay_pass_through(w);
+    OverlayRing* ring = g_new0(OverlayRing, 1);
+    ring->r = 0.31;
+    ring->g = 0.79;
+    ring->b = 0.66;
+    g_object_set_data_full(G_OBJECT(w), "ov-ring", ring, ui_overlay_ring_free);
+    g_signal_connect(w, "draw", G_CALLBACK(ui_overlay_ring_draw), NULL);
+    return w;
+}
+
+static void ui_overlay_ring_set(GtkWidget* widget, double frac,
+        const char* color) {
+    if (widget == NULL)
+        return;
+    OverlayRing* ring = g_object_get_data(G_OBJECT(widget), "ov-ring");
+    if (ring == NULL)
+        return;
+    ring->frac = frac;
+    unsigned int r = 0, g = 0, b = 0;
+    if (color != NULL && sscanf(color, "#%2x%2x%2x", &r, &g, &b) == 3) {
+        ring->r = r / 255.0;
+        ring->g = g / 255.0;
+        ring->b = b / 255.0;
+    }
+    gtk_widget_queue_draw(widget);
+}
+
+/* ---------- 温度折线 ----------
+ * 每秒采一个点、保留 60 秒，右侧最新。纵轴固定 34~100°C，
+ * 不随数据自适应，否则温度平稳时噪声会被放大成锯齿。*/
+static gboolean ui_overlay_spark_draw(GtkWidget* widget, cairo_t* cr,
+        gpointer user_data) {
+    GtkAllocation a;
+    gtk_widget_get_allocation(widget, &a);
+    int n = overlay_spark_len;
+    if (n < 2 || a.width < 8 || a.height < 6)
+        return FALSE;
+
+    const double lo = 34.0, hi = 100.0;
+    double x0 = 1.0, x1 = a.width - 1.0;
+    double y0 = 2.0, y1 = a.height - 2.0;
+    double xs[OVERLAY_SPARK_POINTS], ys[OVERLAY_SPARK_POINTS];
+
+    for (int i = 0; i < n; i++) {
+        int idx = (overlay_spark_pos - n + i + 2 * OVERLAY_SPARK_POINTS)
+                % OVERLAY_SPARK_POINTS;
+        double v = overlay_spark_hist[idx];
+        if (v < lo)
+            v = lo;
+        if (v > hi)
+            v = hi;
+        xs[i] = x0 + (x1 - x0) * (double) i / (double) (n - 1);
+        ys[i] = y1 - (y1 - y0) * (v - lo) / (hi - lo);
+    }
+
+    /* 线下渐变，让折线不至于像一条孤立的细丝 */
+    cairo_move_to(cr, xs[0], y1);
+    for (int i = 0; i < n; i++)
+        cairo_line_to(cr, xs[i], ys[i]);
+    cairo_line_to(cr, xs[n - 1], y1);
+    cairo_close_path(cr);
+    cairo_pattern_t* pat = cairo_pattern_create_linear(0, y0, 0, y1);
+    cairo_pattern_add_color_stop_rgba(pat, 0.0, 1.0, 1.0, 1.0, 0.10);
+    cairo_pattern_add_color_stop_rgba(pat, 1.0, 1.0, 1.0, 1.0, 0.0);
+    cairo_set_source(cr, pat);
+    cairo_fill(cr);
+    cairo_pattern_destroy(pat);
+
+    cairo_move_to(cr, xs[0], ys[0]);
+    for (int i = 1; i < n; i++)
+        cairo_line_to(cr, xs[i], ys[i]);
+    cairo_set_line_width(cr, 1.3);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.72);
+    cairo_stroke(cr);
+
+    /* 末端亮点，强调「当前值在这」 */
+    cairo_arc(cr, xs[n - 1], ys[n - 1], 2.0, 0, 2.0 * M_PI);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.95);
+    cairo_fill(cr);
+    return FALSE;
+}
+
+static GtkWidget* ui_overlay_cap(const char* text) {
+    GtkWidget* label = gtk_label_new(text);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_widget_set_valign(label, GTK_ALIGN_CENTER);
+    gtk_style_context_add_class(gtk_widget_get_style_context(label), "ov-cap");
+    return label;
+}
+
+/* 一块内层卡片：半透明白底 + 圆角，叠在外框上形成层次 */
+static GtkWidget* ui_overlay_row(GtkOrientation orientation) {
+    GtkWidget* box = gtk_box_new(orientation, 8);
+    gtk_style_context_add_class(gtk_widget_get_style_context(box), "ov-row");
     return box;
+}
+
+/* 数值标签：字号/颜色走 CSS，动态颜色时才用 markup 覆盖 */
+static GtkWidget* ui_overlay_value(const char* cls) {
+    GtkWidget* label = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_widget_set_valign(label, GTK_ALIGN_CENTER);
+    gtk_style_context_add_class(gtk_widget_get_style_context(label), cls);
+    return label;
 }
 
 static gboolean ui_overlay_draw(GtkWidget* widget, cairo_t* cr,
         gpointer user_data) {
     GtkAllocation alloc;
     gtk_widget_get_allocation(widget, &alloc);
-    double w = alloc.width, h = alloc.height, r = 13.0;
+    double w = alloc.width, h = alloc.height, r = 18.0;
     if (w <= 2 * r || h <= 2 * r)
         return FALSE;
     cairo_new_sub_path(cr);
@@ -920,12 +1106,24 @@ static gboolean ui_overlay_draw(GtkWidget* widget, cairo_t* cr,
     cairo_arc(cr, r, h - r, r, M_PI / 2.0, M_PI);
     cairo_arc(cr, r, r, r, M_PI, 1.5 * M_PI);
     cairo_close_path(cr);
-    cairo_set_source_rgba(cr, 0.06, 0.07, 0.09, 0.86);
+
+    /* 上浅下深的竖向渐变，比纯色更像一块玻璃板 */
+    cairo_pattern_t* bg = cairo_pattern_create_linear(0, 0, 0, h);
+    cairo_pattern_add_color_stop_rgba(bg, 0.0, 0.115, 0.122, 0.14, 1.0);
+    cairo_pattern_add_color_stop_rgba(bg, 1.0, 0.062, 0.067, 0.08, 1.0);
+    cairo_set_source(cr, bg);
     cairo_fill_preserve(cr);
+    cairo_pattern_destroy(bg);
+
+    /* 顶部一条亮边模拟玻璃高光，底部淡一些 */
+    cairo_pattern_t* edge = cairo_pattern_create_linear(0, 0, 0, h);
+    cairo_pattern_add_color_stop_rgba(edge, 0.0, 1, 1, 1, 0.16);
+    cairo_pattern_add_color_stop_rgba(edge, 1.0, 1, 1, 1, 0.05);
     cairo_set_line_width(cr, 1.0);
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.14);
+    cairo_set_source(cr, edge);
     cairo_stroke(cr);
-    return FALSE;   /* 继续绘制子控件（文字） */
+    cairo_pattern_destroy(edge);
+    return FALSE;   /* 继续绘制子控件 */
 }
 
 static gboolean ui_overlay_button_press(GtkWidget* widget, GdkEventButton* event,
@@ -946,12 +1144,13 @@ static gboolean ui_overlay_button_press(GtkWidget* widget, GdkEventButton* event
     }
     if (event->button == 3 && indicator_menu != NULL) {
         ui_refresh_menuitems();
-#if GTK_CHECK_VERSION(3, 22, 0)
-        gtk_menu_popup_at_pointer(GTK_MENU(indicator_menu), (GdkEvent*) event);
-#else
-        gtk_menu_popup(GTK_MENU(indicator_menu), NULL, NULL, NULL, NULL,
-                event->button, event->time);
-#endif
+        /* 这里必须用 at_rect 锚到点击位置：at_pointer 在本窗口上
+         * 不报错也不弹菜单（窗口不参与焦点管理），换成显式锚点后正常。*/
+        GdkRectangle anchor = { (int) event->x, (int) event->y, 1, 1 };
+        gtk_menu_popup_at_rect(GTK_MENU(indicator_menu),
+                gtk_widget_get_window(widget), &anchor,
+                GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
+                (GdkEvent*) event);
         return TRUE;
     }
     return FALSE;
@@ -983,10 +1182,20 @@ static gboolean ui_overlay_button_release(GtkWidget* widget,
 static void ui_overlay_destroy(GtkWidget* widget, gpointer user_data) {
     overlay_window = NULL;
     overlay_cpu_val = NULL;
+    overlay_cpu_tail = NULL;
     overlay_gpu_val = NULL;
+    overlay_gpu_tail = NULL;
     overlay_fan_mode = NULL;
     overlay_duty_val = NULL;
     overlay_rpm_val = NULL;
+    overlay_ring_gpu = NULL;
+    overlay_ring_duty = NULL;
+    overlay_ring_rpm = NULL;
+    overlay_spark = NULL;
+    /* 关掉再打开时折线从零开始画，不要把上次的历史当成连续数据 */
+    overlay_spark_len = 0;
+    overlay_spark_pos = 0;
+    overlay_spark_tick = 0;
     overlay_dragging = FALSE;
 }
 
@@ -1019,29 +1228,88 @@ static void ui_overlay_show(void) {
     gtk_style_context_add_class(gtk_widget_get_style_context(win),
             "clevo-overlay");
 
-    GtkWidget* grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 16);
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 2);
-    gtk_container_set_border_width(GTK_CONTAINER(grid), 14);
-    gtk_container_add(GTK_CONTAINER(win), grid);
+    /* 卡片结构（自上而下）：
+     *   ① CPU 温度大字 + 右侧档位，下面一条 60 秒温度走势
+     *   ② GPU 温度，右侧 GPU 风扇转速
+     *   ③ 风扇档位，右侧 自动/手动
+     *   ④ 双风扇转速
+     * 每块都是独立的半透明圆角小卡，叠在渐变外框上。*/
+    GtkWidget* outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(outer), 9);
+    gtk_container_add(GTK_CONTAINER(win), outer);
 
-    /* 每个格子都是「小号说明 + 大号数值」，说明和数值在同一个盒子里。
-     * 不用「说明一列、数值一列」的网格：那样列宽会被最长的那一格撑开，
-     * GPU 的 -- 会飘到右边空出一大块。*/
-    GtkWidget* cell;
+    /* ① 主指标 */
+    GtkWidget* hero = ui_overlay_row(GTK_ORIENTATION_VERTICAL);
+    gtk_box_set_spacing(GTK_BOX(hero), 3);
+    GtkWidget* hero_top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_pack_start(GTK_BOX(hero_top), ui_overlay_cap("CPU"), FALSE, FALSE,
+            0);
+    overlay_cpu_val = ui_overlay_value("ov-hero");
+    gtk_box_pack_start(GTK_BOX(hero_top), overlay_cpu_val, FALSE, FALSE, 0);
 
-    cell = ui_overlay_cell("CPU", &overlay_cpu_val, 78, NULL, NULL);
-    gtk_grid_attach(GTK_GRID(grid), cell, 0, 0, 1, 1);
+    overlay_cpu_tail = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(overlay_cpu_tail), 1.0f);
+    gtk_widget_set_halign(overlay_cpu_tail, GTK_ALIGN_END);
+    gtk_widget_set_valign(overlay_cpu_tail, GTK_ALIGN_CENTER);
+    gtk_style_context_add_class(gtk_widget_get_style_context(overlay_cpu_tail),
+            "ov-sub");
+    gtk_box_pack_end(GTK_BOX(hero_top), overlay_cpu_tail, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hero), hero_top, TRUE, TRUE, 0);
 
-    cell = ui_overlay_cell("GPU", &overlay_gpu_val, 78, NULL, NULL);
-    gtk_grid_attach(GTK_GRID(grid), cell, 1, 0, 1, 1);
+    overlay_spark = gtk_drawing_area_new();
+    gtk_widget_set_size_request(overlay_spark, -1, 22);
+    ui_overlay_pass_through(overlay_spark);
+    g_signal_connect(overlay_spark, "draw",
+            G_CALLBACK(ui_overlay_spark_draw), NULL);
+    gtk_box_pack_start(GTK_BOX(hero), overlay_spark, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), hero, TRUE, TRUE, 0);
 
-    cell = ui_overlay_cell("风扇", &overlay_duty_val, 78, "自动",
-            &overlay_fan_mode);
-    gtk_grid_attach(GTK_GRID(grid), cell, 0, 1, 1, 1);
+    /* ② GPU */
+    GtkWidget* row_gpu = ui_overlay_row(GTK_ORIENTATION_HORIZONTAL);
+    overlay_ring_gpu = ui_overlay_ring();
+    gtk_box_pack_start(GTK_BOX(row_gpu), ui_overlay_cap("GPU"), FALSE, FALSE,
+            0);
+    gtk_box_pack_start(GTK_BOX(row_gpu), overlay_ring_gpu, FALSE, FALSE, 0);
+    overlay_gpu_val = ui_overlay_value("ov-val");
+    gtk_box_pack_start(GTK_BOX(row_gpu), overlay_gpu_val, FALSE, FALSE, 0);
 
-    cell = ui_overlay_cell("转速", &overlay_rpm_val, 78, NULL, NULL);
-    gtk_grid_attach(GTK_GRID(grid), cell, 1, 1, 1, 1);
+    overlay_gpu_tail = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(overlay_gpu_tail), 1.0f);
+    gtk_widget_set_halign(overlay_gpu_tail, GTK_ALIGN_END);
+    gtk_style_context_add_class(gtk_widget_get_style_context(overlay_gpu_tail),
+            "ov-sub");
+    gtk_box_pack_end(GTK_BOX(row_gpu), overlay_gpu_tail, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), row_gpu, TRUE, TRUE, 0);
+
+    /* ③ 风扇档位 */
+    GtkWidget* row_duty = ui_overlay_row(GTK_ORIENTATION_HORIZONTAL);
+    overlay_ring_duty = ui_overlay_ring();
+    gtk_box_pack_start(GTK_BOX(row_duty), ui_overlay_cap("风扇"), FALSE, FALSE,
+            0);
+    gtk_box_pack_start(GTK_BOX(row_duty), overlay_ring_duty, FALSE, FALSE, 0);
+    overlay_duty_val = ui_overlay_value("ov-val");
+    gtk_box_pack_start(GTK_BOX(row_duty), overlay_duty_val, FALSE, FALSE, 0);
+
+    overlay_fan_mode = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(overlay_fan_mode), 1.0f);
+    gtk_widget_set_halign(overlay_fan_mode, GTK_ALIGN_END);
+    gtk_style_context_add_class(gtk_widget_get_style_context(overlay_fan_mode),
+            "ov-sub");
+    gtk_box_pack_end(GTK_BOX(row_duty), overlay_fan_mode, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), row_duty, TRUE, TRUE, 0);
+
+    /* ④ 转速 */
+    GtkWidget* row_rpm = ui_overlay_row(GTK_ORIENTATION_HORIZONTAL);
+    overlay_ring_rpm = ui_overlay_ring();
+    gtk_box_pack_start(GTK_BOX(row_rpm), ui_overlay_cap("转速"), FALSE, FALSE,
+            0);
+    gtk_box_pack_start(GTK_BOX(row_rpm), overlay_ring_rpm, FALSE, FALSE, 0);
+    overlay_rpm_val = ui_overlay_value("ov-val");
+    gtk_box_pack_start(GTK_BOX(row_rpm), overlay_rpm_val, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(outer), row_rpm, TRUE, TRUE, 0);
+
+    /* 固定宽度：数值位数变化时卡片不左右伸缩 */
+    gtk_widget_set_size_request(outer, 264, -1);
 
     gtk_widget_add_events(win, GDK_BUTTON_PRESS_MASK
             | GDK_BUTTON_RELEASE_MASK | GDK_BUTTON1_MOTION_MASK);
@@ -1084,7 +1352,7 @@ static void ui_overlay_show(void) {
     gtk_window_get_size(GTK_WINDOW(win), &w, &h);
 
     if (px >= 0 && py >= 0) {
-        overlay_last_x = px;
+    overlay_last_x = px;
         overlay_last_y = py;
     } else {
         /* 默认丢到主屏右上角，避开托盘和顶部面板 */
@@ -1108,48 +1376,89 @@ static void ui_overlay_update(void) {
     char buf[256];
 
     int t = (int) share_info->cpu_temp;
+    int gt = (int) share_info->gpu_temp;
+    int duty = (int) share_info->fan_duty;
+    int rpm = (int) share_info->fan_rpms;
+    int rpm2 = (int) share_info->fan2_rpms;
+    int auto_mode = share_info->auto_duty ? 1 : 0;
+
+    /* ① CPU 大字。字号由 CSS 决定，这里只覆盖颜色 */
     snprintf(buf, sizeof(buf),
-            "<span size='x-large' weight='bold' color='%s'>%d°C</span>",
+            "<span foreground='%s'>%d°</span>",
             ui_overlay_temp_color(t), t);
     gtk_label_set_markup(GTK_LABEL(overlay_cpu_val), buf);
 
-    int gt = (int) share_info->gpu_temp;
+    snprintf(buf, sizeof(buf),
+            "<span foreground='%s'>%d%%</span>"
+            "<span foreground='#6b6e75'> · </span>"
+            "<span foreground='%s'>%s</span>",
+            "#8ab4f8", duty,
+            auto_mode ? "#7d8087" : "#d9a066",
+            auto_mode ? "自动" : "手动");
+    gtk_label_set_markup(GTK_LABEL(overlay_cpu_tail), buf);
+
+    /* ② GPU 温度：本机 EC 不上报二极管，NVML 也拿不到时显示 -- */
     if (gt > 0) {
         snprintf(buf, sizeof(buf),
-                "<span size='x-large' weight='bold' color='%s'>%d°C</span>",
+                "<span foreground='%s'>%d°</span>",
                 ui_overlay_temp_color(gt), gt);
+        ui_overlay_ring_set(overlay_ring_gpu,
+                (gt - 20) / 75.0, ui_overlay_ring_temp_color(gt));
     } else {
-        /* 本机 EC 不上报 GPU 二极管，显示 -- 而不是假温度 */
         snprintf(buf, sizeof(buf),
-                "<span size='x-large' weight='bold' color='#5c626b'>--</span>");
+                "<span foreground='#6b6e75'>--</span>");
+        ui_overlay_ring_set(overlay_ring_gpu, 0.0, ui_overlay_ring_temp_color(0));
     }
     gtk_label_set_markup(GTK_LABEL(overlay_gpu_val), buf);
 
-    if (share_info->auto_duty)
-        gtk_label_set_markup(GTK_LABEL(overlay_fan_mode),
-                "<span size='small' color='#8b9199'>自动</span>");
-    else
-        gtk_label_set_markup(GTK_LABEL(overlay_fan_mode),
-                "<span size='small' color='#d9a066'>手动</span>");
-
-    /* 当前档位：EC 回读的实际 PWM 占空比 */
-    snprintf(buf, sizeof(buf),
-            "<span size='x-large' weight='bold' color='#8ab4f8'>%d%%</span>",
-            (int) share_info->fan_duty);
-    gtk_label_set_markup(GTK_LABEL(overlay_duty_val), buf);
-
-    if (share_info->fan2_rpms > 0) {
+    if (rpm2 > 0) {
         snprintf(buf, sizeof(buf),
-                "<span color='#c8ccd0'>%d/%d</span>"
-                "<span size='small' color='#8b9199'> RPM</span>",
-                (int) share_info->fan_rpms, (int) share_info->fan2_rpms);
+                "<span foreground='#878a91'>%d RPM</span>",
+                rpm2);
+        gtk_label_set_markup(GTK_LABEL(overlay_gpu_tail), buf);
+    } else {
+        /* 单风扇机型没有 GPU 风扇，右侧留空而不是显示 0 */
+        gtk_label_set_text(GTK_LABEL(overlay_gpu_tail), "");
+    }
+
+    /* ③ 档位 */
+    snprintf(buf, sizeof(buf),
+            "<span foreground='#8ab4f8'>%d%%</span>", duty);
+    gtk_label_set_markup(GTK_LABEL(overlay_duty_val), buf);
+    ui_overlay_ring_set(overlay_ring_duty, duty / 100.0, "#8ab4f8");
+
+    gtk_label_set_markup(GTK_LABEL(overlay_fan_mode),
+            auto_mode
+                    ? "<span foreground='#878a91'>自动</span>"
+                    : "<span foreground='#d9a066'>手动</span>");
+
+    /* ④ 双风扇转速 */
+    if (rpm2 > 0) {
+        snprintf(buf, sizeof(buf),
+                "<span foreground='#eef1f4'>%d</span>"
+                "<span foreground='#6b6e75'> / </span>"
+                "<span foreground='#eef1f4'>%d</span>",
+                rpm, rpm2);
     } else {
         snprintf(buf, sizeof(buf),
-                "<span color='#c8ccd0'>%d</span>"
-                "<span size='small' color='#8b9199'> RPM</span>",
-                (int) share_info->fan_rpms);
+                "<span foreground='#eef1f4'>%d</span>", rpm);
     }
     gtk_label_set_markup(GTK_LABEL(overlay_rpm_val), buf);
+    int peak = MAX(rpm, rpm2);
+    ui_overlay_ring_set(overlay_ring_rpm,
+            (double) peak / (double) MAX_FAN_RPM, "#8ab4f8");
+
+
+    /* 温度走势：UI 每 500ms 刷一次，这里每两次采一个点，即每秒一个 */
+    if (++overlay_spark_tick >= 2) {
+        overlay_spark_tick = 0;
+        overlay_spark_hist[overlay_spark_pos] = t;
+        overlay_spark_pos = (overlay_spark_pos + 1) % OVERLAY_SPARK_POINTS;
+        if (overlay_spark_len < OVERLAY_SPARK_POINTS)
+            overlay_spark_len++;
+        if (overlay_spark != NULL)
+            gtk_widget_queue_draw(overlay_spark);
+    }
 }
 
 static void ui_command_overlay(long ignored) {
