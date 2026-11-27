@@ -95,7 +95,8 @@
 #define MAX_FAN_RPM 6000.0  /* T1000 实测 GPU 风扇满速约 5940 RPM */
 
 typedef enum {
-    NA = 0, AUTO = 1, MANUAL = 2, EPP = 3, CUSTOM = 4, OVERLAY = 5
+    NA = 0, AUTO = 1, MANUAL = 2, EPP = 3, CUSTOM = 4, OVERLAY = 5,
+    AUTOHIDE = 6
 } MenuItemType;
 
 /* 风扇占空比上下限。本机实测（T1000，双风扇）：
@@ -122,19 +123,28 @@ static gboolean ui_update(gpointer user_data);
 static void ui_command_set_fan(long fan_duty);
 static void ui_command_custom(long ignored);
 static void ui_command_overlay(long ignored);
+static void ui_command_autohide(long ignored);
 static void ui_command_set_epp(long which);
 static void ui_refresh_menuitems(void);
 static void ui_on_menu_show(GtkWidget* widget, gpointer data);
+/* 菜单收起后再给 3 秒缓冲，然后把「闲置 8 秒」重新走一遍 */
+static void ui_on_menu_deactivate(GtkWidget* widget, gpointer data);
 static void ui_load_css(void);
 static void ui_overlay_show(void);
+static void ui_overlay_screen_rect(int* sx, int* sy, int* sw, int* sh);
 static GtkWidget* ui_overlay_cap(const char* text);
 static GtkWidget* ui_overlay_row(GtkOrientation orientation);
 static GtkWidget* ui_overlay_ring(void);
 static void ui_overlay_ring_set(GtkWidget* ring, double frac,
         const char* color);
 static void ui_overlay_update(void);
+static void ui_overlay_collapse(void);
+static void ui_overlay_expand(void);
+static void ui_overlay_tab_destroy(void);
+static gboolean ui_overlay_enter(GtkWidget* w, GdkEventCrossing* e, gpointer d);
+static gboolean ui_overlay_leave(GtkWidget* w, GdkEventCrossing* e, gpointer d);
 static void ui_overlay_config_save(int visible, int x, int y);
-static int ui_overlay_config_load(int* visible, int* x, int* y);
+static int ui_overlay_config_load(int* visible, int* x, int* y, int* autohide);
 static int sysfs_apply_epp(int which);
 static int sysfs_query_epp(void);
 static char* epp_config_path(void);
@@ -210,6 +220,24 @@ static int overlay_drag_dy = 0;
 static int overlay_last_x = -1;
 static int overlay_last_y = -1;
 
+/* ---------- 自动贴边 ----------
+ * 鼠标离开卡片一段时间后，卡片收成贴着屏幕边的一条小把手，点它展开。
+ * 把手仍在刷温度色，收起状态下也能看出机器烫不烫。*/
+#define OVERLAY_AUTOHIDE_SEC 8       /* 无鼠标停留多久后收起 */
+#define OVERLAY_TAB_SHORT    15      /* 把手厚度（贴边那一维） */
+#define OVERLAY_TAB_LONG     92      /* 把手长度（顺着边那一维） */
+
+static GtkWidget* overlay_tab = NULL;    /* 收起后的小把手窗口 */
+static gboolean overlay_collapsed = FALSE;
+static gboolean overlay_autohide = TRUE; /* 菜单可关 */
+static gboolean overlay_hover = FALSE;   /* 鼠标是否在卡片上 */
+/* 右键菜单弹出后先别收，给用户留出选项目的时间。
+ * 不用「菜单是否可见」判断：appindicator 会把菜单 widget 一直置为 visible，
+ * 拿它当条件会导致永远不收。*/
+static gint64 overlay_hold_until = 0;
+static int overlay_idle_ticks = 0;       /* 连续多少个 500ms 没被碰过 */
+static int overlay_tab_side = 1;         /* 0=左 1=右 2=上 3=下 */
+
 struct {
     char label[256];
     GCallback callback;
@@ -234,7 +262,9 @@ struct {
         { "风扇：自定义…", G_CALLBACK(ui_command_custom), 0L, CUSTOM, NULL },
         { "", NULL, 0L, NA, NULL },
         { "悬浮窗：显示温度与转速", G_CALLBACK(ui_command_overlay), 0L, OVERLAY,
-                NULL }
+                NULL },
+        { "悬浮窗：闲置后自动贴边", G_CALLBACK(ui_command_autohide), 0L,
+                AUTOHIDE, NULL }
 };
 
 static int menuitem_count = (sizeof(menuitems) / sizeof(menuitems[0]));
@@ -566,6 +596,9 @@ static void main_ui_worker(int argc, char** argv) {
     gtk_widget_show_all(indicator_menu);
     /* 每次展开菜单前刷新勾选状态，避免显示过期 */
     g_signal_connect(indicator_menu, "show", G_CALLBACK(ui_on_menu_show), NULL);
+    /* 菜单收起后尽快恢复自动收起，不必等右键那一刻算起的 20 秒 */
+    g_signal_connect(indicator_menu, "deactivate",
+            G_CALLBACK(ui_on_menu_deactivate), NULL);
     //
     indicator = app_indicator_new(NAME, "brasero",
             APP_INDICATOR_CATEGORY_HARDWARE);
@@ -588,7 +621,7 @@ static void main_ui_worker(int argc, char** argv) {
     {
         /* 上次开着悬浮窗的话，开机自动恢复 */
         int vis = 0, ox = -1, oy = -1;
-        if (ui_overlay_config_load(&vis, &ox, &oy) && vis)
+        if (ui_overlay_config_load(&vis, &ox, &oy, &overlay_autohide) && vis)
             ui_overlay_show();
     }
     gtk_main();
@@ -639,6 +672,16 @@ static gboolean ui_update(gpointer user_data) {
     app_indicator_set_label(indicator, label, "XXXXXX");
     /* 悬浮窗跟随刷新：温度、档位、转速 */
     ui_overlay_update();
+    /* 闲置一段时间没人理就收成贴边的小把手。鼠标在卡片上、
+     * 正在拖动、或用户关了自动贴边时不收。*/
+    if (overlay_autohide && overlay_window != NULL && !overlay_collapsed
+            && !overlay_hover && !overlay_dragging
+            && g_get_monotonic_time() >= overlay_hold_until) {
+        if (++overlay_idle_ticks >= OVERLAY_AUTOHIDE_SEC * 2)
+            ui_overlay_collapse();
+    } else {
+        overlay_idle_ticks = 0;
+    }
     /* 自定义窗口打开时同步显示实际占空比与转速 */
     if (custom_rpm_label != NULL) {
         char buf[128];
@@ -872,25 +915,27 @@ static void ui_overlay_config_save(int visible, int x, int y) {
     FILE* fp = fopen(p, "w");
     if (fp == NULL)
         return;
-    fprintf(fp, "%d\n%d %d\n", visible, x, y);
+    fprintf(fp, "%d\n%d %d\n%d\n", visible, x, y, overlay_autohide ? 1 : 0);
     fclose(fp);
 }
 
-static int ui_overlay_config_load(int* visible, int* x, int* y) {
+static int ui_overlay_config_load(int* visible, int* x, int* y, int* autohide) {
     if (visible != NULL)
         *visible = 0;
     if (x != NULL)
         *x = -1;
     if (y != NULL)
         *y = -1;
+    if (autohide != NULL)
+        *autohide = 1;   /* 旧配置文件没这一项，按默认开启 */
     char* p = ui_overlay_config_path();
     if (p == NULL)
         return 0;
     FILE* fp = fopen(p, "r");
     if (fp == NULL)
         return 0;
-    int vis = 0, px = -1, py = -1;
-    int n = fscanf(fp, "%d %d %d", &vis, &px, &py);
+    int vis = 0, px = -1, py = -1, ah = 1;
+    int n = fscanf(fp, "%d %d %d %d", &vis, &px, &py, &ah);
     fclose(fp);
     if (n < 1)
         return 0;
@@ -902,6 +947,8 @@ static int ui_overlay_config_load(int* visible, int* x, int* y) {
         if (y != NULL)
             *y = py;
     }
+    if (n >= 4 && autohide != NULL)
+        *autohide = ah ? 1 : 0;
     return 1;
 }
 
@@ -1126,6 +1173,205 @@ static gboolean ui_overlay_draw(GtkWidget* widget, cairo_t* cr,
     return FALSE;   /* 继续绘制子控件 */
 }
 
+/* ---------- 收起后的小把手 ----------
+ * 贴边只留一条 15px 的胶囊，中间三个小点用当前 CPU 温度的配色，
+ * 收起来也能瞟一眼机器烫不烫。点它恢复卡片。*/
+
+static void ui_overlay_round_rect(cairo_t* cr, double x, double y, double w,
+        double h, double r) {
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r, r, -M_PI / 2.0, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0, M_PI / 2.0);
+    cairo_arc(cr, x + r, y + h - r, r, M_PI / 2.0, M_PI);
+    cairo_arc(cr, x + r, y + r, r, M_PI, 1.5 * M_PI);
+    cairo_close_path(cr);
+}
+
+static void ui_overlay_hex_rgb(const char* hex, double* r, double* g,
+        double* b) {
+    unsigned int ri = 238, gi = 241, bi = 244;
+    if (hex != NULL)
+        sscanf(hex, "#%2x%2x%2x", &ri, &gi, &bi);
+    *r = ri / 255.0;
+    *g = gi / 255.0;
+    *b = bi / 255.0;
+}
+
+static gboolean ui_overlay_tab_draw(GtkWidget* widget, cairo_t* cr,
+        gpointer user_data) {
+    GtkAllocation a;
+    gtk_widget_get_allocation(widget, &a);
+    double w = a.width, h = a.height;
+    if (w <= 6 || h <= 6)
+        return FALSE;
+    int vertical = h > w;
+
+    ui_overlay_round_rect(cr, 0.5, 0.5, w - 1, h - 1, MIN(w, h) / 2.0 - 0.5);
+    cairo_set_source_rgba(cr, 0.098, 0.106, 0.125, 0.94);
+    cairo_fill_preserve(cr);
+    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.13);
+    cairo_stroke(cr);
+
+    /* 三个点顺着边的方向排，颜色跟卡片里的温度文字一致 */
+    double r, g, b;
+    ui_overlay_hex_rgb(ui_overlay_temp_color((int) share_info->cpu_temp),
+            &r, &g, &b);
+    cairo_set_source_rgba(cr, r, g, b, 0.92);
+    for (int i = -1; i <= 1; i++) {
+        double px = vertical ? w / 2.0 : w / 2.0 + i * 10.0;
+        double py = vertical ? h / 2.0 + i * 10.0 : h / 2.0;
+        cairo_arc(cr, px, py, 1.7, 0, 2.0 * M_PI);
+        cairo_fill(cr);
+    }
+    return FALSE;
+}
+
+static void ui_overlay_tab_on_destroy(GtkWidget* widget, gpointer user_data) {
+    overlay_tab = NULL;
+}
+
+static gboolean ui_overlay_tab_click(GtkWidget* widget, GdkEventButton* event,
+        gpointer user_data) {
+    if (event->button == 1) {
+        ui_overlay_expand();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* 贴最近的一条边：比较卡片到四边的距离，然后把手居中挂在那一侧 */
+static void ui_overlay_tab_place(void) {
+    if (overlay_tab == NULL || overlay_window == NULL)
+        return;
+    int sx = 0, sy = 0, sw = 1920, sh = 1080;
+    ui_overlay_screen_rect(&sx, &sy, &sw, &sh);
+
+    int cw = 264, ch = 248;
+    gtk_window_get_size(GTK_WINDOW(overlay_window), &cw, &ch);
+    int cx = overlay_last_x, cy = overlay_last_y;
+
+    int dl = cx - sx;
+    int dr = (sx + sw) - (cx + cw);
+    int dt = cy - sy;
+    int db = (sy + sh) - (cy + ch);
+    int side = 1, best = dr;
+    if (dl < best) {
+        best = dl;
+        side = 0;
+    }
+    if (dt < best) {
+        best = dt;
+        side = 2;
+    }
+    if (db < best) {
+        best = db;
+        side = 3;
+    }
+    overlay_tab_side = side;
+
+    int tw = (side <= 1) ? OVERLAY_TAB_SHORT : OVERLAY_TAB_LONG;
+    int th = (side <= 1) ? OVERLAY_TAB_LONG : OVERLAY_TAB_SHORT;
+    int tx, ty;
+    if (side == 0) {
+        tx = sx;
+        ty = cy + ch / 2 - th / 2;
+    } else if (side == 1) {
+        tx = sx + sw - tw;
+        ty = cy + ch / 2 - th / 2;
+    } else if (side == 2) {
+        tx = cx + cw / 2 - tw / 2;
+        ty = sy;
+    } else {
+        tx = cx + cw / 2 - tw / 2;
+        ty = sy + sh - th;
+    }
+    if (tx < sx)
+        tx = sx;
+    if (tx + tw > sx + sw)
+        tx = sx + sw - tw;
+    if (ty < sy)
+        ty = sy;
+    if (ty + th > sy + sh)
+        ty = sy + sh - th;
+
+    gtk_widget_set_size_request(overlay_tab, tw, th);
+    gtk_window_resize(GTK_WINDOW(overlay_tab), tw, th);
+    gtk_window_move(GTK_WINDOW(overlay_tab), tx, ty);
+}
+
+static void ui_overlay_tab_create(void) {
+    if (overlay_tab != NULL)
+        return;
+    GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), "clevo-overlay-tab");
+    gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
+    gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(win), TRUE);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(win), TRUE);
+    gtk_window_set_accept_focus(GTK_WINDOW(win), FALSE);
+    gtk_window_set_focus_on_map(GTK_WINDOW(win), FALSE);
+    gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_UTILITY);
+    GdkScreen* screen = gtk_widget_get_screen(win);
+    GdkVisual* visual = gdk_screen_get_rgba_visual(screen);
+    if (visual != NULL && gdk_screen_is_composited(screen))
+        gtk_widget_set_visual(win, visual);
+    gtk_widget_set_app_paintable(win, TRUE);
+    gtk_widget_add_events(win, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(win, "draw", G_CALLBACK(ui_overlay_tab_draw), NULL);
+    g_signal_connect(win, "button-press-event",
+            G_CALLBACK(ui_overlay_tab_click), NULL);
+    g_signal_connect(win, "destroy", G_CALLBACK(ui_overlay_tab_on_destroy),
+            NULL);
+    overlay_tab = win;
+}
+
+static void ui_overlay_tab_destroy(void) {
+    if (overlay_tab != NULL) {
+        gtk_widget_destroy(overlay_tab);   /* destroy 回调会清空指针 */
+        overlay_tab = NULL;
+    }
+}
+
+static void ui_overlay_collapse(void) {
+    if (overlay_window == NULL || overlay_collapsed)
+        return;
+    overlay_collapsed = TRUE;
+    ui_overlay_tab_create();
+    ui_overlay_tab_place();          /* 需要卡片还可见时取尺寸 */
+    gtk_widget_show_all(overlay_tab);
+    ui_overlay_tab_place();          /* map 之后再定位一次，防止 WM 摆到别处 */
+    gtk_widget_hide(overlay_window);
+    overlay_idle_ticks = 0;
+}
+
+static void ui_overlay_expand(void) {
+    overlay_collapsed = FALSE;
+    ui_overlay_tab_destroy();
+    overlay_idle_ticks = 0;
+    if (overlay_window != NULL) {
+        gtk_window_move(GTK_WINDOW(overlay_window), overlay_last_x,
+                overlay_last_y);
+        gtk_widget_show(overlay_window);
+        gtk_window_present(GTK_WINDOW(overlay_window));
+    }
+}
+
+static gboolean ui_overlay_enter(GtkWidget* widget, GdkEventCrossing* event,
+        gpointer user_data) {
+    overlay_hover = TRUE;
+    overlay_idle_ticks = 0;
+    return FALSE;
+}
+
+static gboolean ui_overlay_leave(GtkWidget* widget, GdkEventCrossing* event,
+        gpointer user_data) {
+    overlay_hover = FALSE;
+    overlay_idle_ticks = 0;
+    return FALSE;
+}
+
 static gboolean ui_overlay_button_press(GtkWidget* widget, GdkEventButton* event,
         gpointer user_data) {
     if (event->button == 1) {
@@ -1144,6 +1390,10 @@ static gboolean ui_overlay_button_press(GtkWidget* widget, GdkEventButton* event
     }
     if (event->button == 3 && indicator_menu != NULL) {
         ui_refresh_menuitems();
+        /* 菜单弹出后 20 秒内不自动收起，免得刚点开卡片就缩没了 */
+        overlay_hold_until = g_get_monotonic_time()
+                + 20 * G_TIME_SPAN_SECOND;
+        overlay_idle_ticks = 0;
         /* 这里必须用 at_rect 锚到点击位置：at_pointer 在本窗口上
          * 不报错也不弹菜单（窗口不参与焦点管理），换成显式锚点后正常。*/
         GdkRectangle anchor = { (int) event->x, (int) event->y, 1, 1 };
@@ -1173,6 +1423,7 @@ static gboolean ui_overlay_button_release(GtkWidget* widget,
         gtk_window_get_position(GTK_WINDOW(widget), &wx, &wy);
         overlay_last_x = wx;
         overlay_last_y = wy;
+        overlay_idle_ticks = 0;   /* 刚摆好位置，重新开始计闲置 */
         ui_overlay_config_save(1, wx, wy);
         return TRUE;
     }
@@ -1197,6 +1448,36 @@ static void ui_overlay_destroy(GtkWidget* widget, gpointer user_data) {
     overlay_spark_pos = 0;
     overlay_spark_tick = 0;
     overlay_dragging = FALSE;
+    overlay_collapsed = FALSE;
+    overlay_hover = FALSE;
+    overlay_idle_ticks = 0;
+    ui_overlay_tab_destroy();
+}
+
+/* 主屏可用区域。固定主屏、不跟随鼠标，避免卡片在多屏间跳来跳去。*/
+static void ui_overlay_screen_rect(int* sx, int* sy, int* sw, int* sh) {
+    *sx = 0;
+    *sy = 0;
+    *sw = 1920;
+    *sh = 1080;
+#if GTK_CHECK_VERSION(3, 22, 0)
+    GdkDisplay* disp = gdk_display_get_default();
+    GdkMonitor* mon = gdk_display_get_primary_monitor(disp);
+    if (mon == NULL)
+        mon = gdk_display_get_monitor(disp, 0);
+    if (mon != NULL) {
+        GdkRectangle geo;
+        gdk_monitor_get_geometry(mon, &geo);
+        *sx = geo.x;
+        *sy = geo.y;
+        *sw = geo.width;
+        *sh = geo.height;
+    }
+#else
+    GdkScreen* screen = gdk_screen_get_default();
+    *sw = gdk_screen_get_width(screen);
+    *sh = gdk_screen_get_height(screen);
+#endif
 }
 
 static void ui_overlay_show(void) {
@@ -1206,7 +1487,7 @@ static void ui_overlay_show(void) {
     }
 
     int vis = 0, px = -1, py = -1;
-    ui_overlay_config_load(&vis, &px, &py);
+    ui_overlay_config_load(&vis, &px, &py, &overlay_autohide);
 
     GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "clevo-overlay");
@@ -1312,7 +1593,8 @@ static void ui_overlay_show(void) {
     gtk_widget_set_size_request(outer, 264, -1);
 
     gtk_widget_add_events(win, GDK_BUTTON_PRESS_MASK
-            | GDK_BUTTON_RELEASE_MASK | GDK_BUTTON1_MOTION_MASK);
+            | GDK_BUTTON_RELEASE_MASK | GDK_BUTTON1_MOTION_MASK
+            | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
 
     g_signal_connect(win, "draw", G_CALLBACK(ui_overlay_draw), NULL);
     g_signal_connect(win, "button-press-event",
@@ -1321,6 +1603,11 @@ static void ui_overlay_show(void) {
             G_CALLBACK(ui_overlay_button_release), NULL);
     g_signal_connect(win, "motion-notify-event", G_CALLBACK(ui_overlay_motion),
             NULL);
+    /* 鼠标在卡片上时不自动收起，离开后重新计时 */
+    g_signal_connect(win, "enter-notify-event",
+            G_CALLBACK(ui_overlay_enter), NULL);
+    g_signal_connect(win, "leave-notify-event",
+            G_CALLBACK(ui_overlay_leave), NULL);
     g_signal_connect(win, "destroy", G_CALLBACK(ui_overlay_destroy), NULL);
 
     overlay_window = win;
@@ -1330,23 +1617,7 @@ static void ui_overlay_show(void) {
     /* 屏幕区域：既用于默认摆放，也用于把跑出屏幕的旧坐标拉回来
      * （卡片宽度会随数值位数变化，旧位置可能已经贴边）*/
     int sx = 0, sy = 0, sw = 1920, sh = 1080;
-#if GTK_CHECK_VERSION(3, 22, 0)
-    GdkDisplay* disp = gdk_display_get_default();
-    GdkMonitor* mon = gdk_display_get_primary_monitor(disp);
-    if (mon == NULL)
-        mon = gdk_display_get_monitor(disp, 0);
-    if (mon != NULL) {
-        GdkRectangle geo;
-        gdk_monitor_get_geometry(mon, &geo);
-        sx = geo.x;
-        sy = geo.y;
-        sw = geo.width;
-        sh = geo.height;
-    }
-#else
-    sw = gdk_screen_get_width(screen);
-    sh = gdk_screen_get_height(screen);
-#endif
+    ui_overlay_screen_rect(&sx, &sy, &sw, &sh);
 
     int w = 0, h = 0;
     gtk_window_get_size(GTK_WINDOW(win), &w, &h);
@@ -1465,13 +1736,29 @@ static void ui_overlay_update(void) {
 }
 
 static void ui_command_overlay(long ignored) {
-    if (overlay_window != NULL) {
+    if (overlay_window != NULL && overlay_collapsed) {
+        /* 收起态下点这项是「展开」，不是关掉 */
+        ui_overlay_expand();
+    } else if (overlay_window != NULL) {
+        ui_overlay_tab_destroy();
+        overlay_collapsed = FALSE;
         ui_overlay_config_save(0, overlay_last_x, overlay_last_y);
         gtk_widget_destroy(overlay_window);   /* destroy 回调会清空指针 */
     } else {
         ui_overlay_show();
         ui_overlay_config_save(1, overlay_last_x, overlay_last_y);
     }
+    ui_refresh_menuitems();
+}
+
+static void ui_command_autohide(long ignored) {
+    overlay_autohide = !overlay_autohide;
+    overlay_idle_ticks = 0;
+    /* 关掉开关时如果正收着，立刻展开回来，否则卡片会一直挂着收不回去 */
+    if (!overlay_autohide && overlay_collapsed)
+        ui_overlay_expand();
+    int visible = (overlay_window != NULL && !overlay_collapsed);
+    ui_overlay_config_save(visible, overlay_last_x, overlay_last_y);
     ui_refresh_menuitems();
 }
 
@@ -1486,6 +1773,11 @@ static void ui_command_set_epp(long which) {
 
 static void ui_on_menu_show(GtkWidget* widget, gpointer data) {
     ui_refresh_menuitems();
+}
+
+static void ui_on_menu_deactivate(GtkWidget* widget, gpointer data) {
+    overlay_hold_until = g_get_monotonic_time() + 3 * G_TIME_SPAN_SECOND;
+    overlay_idle_ticks = 0;
 }
 
 static void ui_refresh_menuitems(void) {
@@ -1517,7 +1809,11 @@ static void ui_refresh_menuitems(void) {
             break;
         }
         case OVERLAY:
-            active = (overlay_window != NULL);
+            /* 收起成把手时算「没显示」，菜单文案随之变成「显示温度与转速」 */
+            active = (overlay_window != NULL && !overlay_collapsed);
+            break;
+        case AUTOHIDE:
+            active = overlay_autohide;
             break;
         default:
             break;
