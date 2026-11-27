@@ -1388,13 +1388,16 @@ static void ui_overlay_update(void) {
             ui_overlay_temp_color(t), t);
     gtk_label_set_markup(GTK_LABEL(overlay_cpu_val), buf);
 
+    /* 主指标行右侧：CPU 电源模式。
+     * 这里原来重复显示「档位% · 自动/手动」，和下面「风扇」行完全同义，
+     * 换成 EPP 档位（省电 / 系统默认）后才有独立信息量。*/
+    int epp = share_info->epp_state;
     snprintf(buf, sizeof(buf),
-            "<span foreground='%s'>%d%%</span>"
-            "<span foreground='#6b6e75'> · </span>"
-            "<span foreground='%s'>%s</span>",
-            "#8ab4f8", duty,
-            auto_mode ? "#7d8087" : "#d9a066",
-            auto_mode ? "自动" : "手动");
+            "<span size='small' foreground='%s'>●</span>"
+            "<span foreground='%s'> %s</span>",
+            epp == EPP_POWER ? "#7cc48a" : "#8a8d94",
+            epp == EPP_POWER ? "#a8d4b2" : "#9a9da4",
+            epp == EPP_POWER ? "省电" : "系统默认");
     gtk_label_set_markup(GTK_LABEL(overlay_cpu_tail), buf);
 
     /* ② GPU 温度：本机 EC 不上报二极管，NVML 也拿不到时显示 -- */
